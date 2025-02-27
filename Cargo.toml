@@ -1,0 +1,10 @@
+[package]
+name = "m68k_emulator"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+
+[lib]
+name = "m68k_emulator"
+path = "src/lib.rs"
