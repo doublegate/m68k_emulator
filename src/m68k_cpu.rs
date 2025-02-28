@@ -1,8 +1,11 @@
 /// Motorola 68k CPU Emulator in Rust ('m68k_cpu.rs')
 /// Aims for 100% hardware and timing accuracy based on the M68000 Programmer's Reference Manual
 
+use crate::memory::Memory;
+use crate::memory::Exception;
+
 // Define the data size for operations
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Size {
     Byte,
     Word,
@@ -157,56 +160,13 @@ struct Instruction {
     dst: Option<Operand>,
 }
 
-// Memory implementation with big-endian byte order
-pub struct Memory {
-    data: Vec<u8>,
-}
-
-impl Memory {
-    fn new(size: usize) -> Memory {
-        Memory {
-            data: vec![0; size], // 16 MB address space (24-bit addressing)
-        }
-    }
-
-    fn read_byte(&self, address: u32) -> u8 {
-        self.data[(address & 0xFFFFFF) as usize]
-    }
-
-    fn write_byte(&mut self, address: u32, value: u8) {
-        self.data[(address & 0xFFFFFF) as usize] = value;
-    }
-
-    fn read_word(&self, address: u32) -> u16 {
-        let addr = (address & 0xFFFFFF) as usize;
-        ((self.data[addr] as u16) << 8) | (self.data[addr + 1] as u16)
-    }
-
-    fn write_word(&mut self, address: u32, value: u16) {
-        let addr = (address & 0xFFFFFF) as usize;
-        self.data[addr] = (value >> 8) as u8;
-        self.data[addr + 1] = value as u8;
-    }
-
-    fn read_long(&self, address: u32) -> u32 {
-        let addr = (address & 0xFFFFFF) as usize;
-        ((self.read_word(address) as u32) << 16) | (self.read_word(address + 2) as u32)
-    }
-
-    fn write_long(&mut self, address: u32, value: u32) {
-        let addr = (address & 0xFFFFFF) as usize;
-        self.write_word(address, (value >> 16) as u16);
-        self.write_word(address + 2, value as u16);
-    }
-}
-
 // CPU state and operations
 pub struct CPU {
-    d: [u32; 8],         // Data registers D0-D7
-    a: [u32; 8],         // Address registers A0-A7 (A7 is stack pointer)
-    pc: u32,             // Program counter
-    sr: u16,             // Status register (T S IPL XNZVC)
-    memory: Memory,      // Memory
+    pub d: [u32; 8],         // Data registers D0-D7
+    pub a: [u32; 8],         // Address registers A0-A7 (A7 is stack pointer)
+    pub pc: u32,             // Program counter
+    pub sr: u16,             // Status register (T S IPL XNZVC)
+    pub memory: Memory,      // Memory
     cycle_count: u64,    // Total cycles for timing accuracy
     pending_interrupts: Vec<(u8, Option<u8>)>, // (level, vector): Queue of pending interrupts
     interrupt_ack: Option<u8>, // Level being acknowledged
@@ -216,7 +176,7 @@ pub struct CPU {
     prefetch_queue: [u16; 2],  // Two-word prefetch queue
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum BusState {
     Idle,
     Iack(u8), // Interrupt acknowledge cycle with level
@@ -226,13 +186,16 @@ pub enum BusState {
 
 impl CPU {
     /// Initialize a new CPU with a given memory size
-    pub fn new(memory_size: usize) -> CPU {
+    pub fn new(memory: Memory) -> CPU {
+		let ram_size = memory.ram.len() as u32;
+		let rom_size = memory.rom.len() as u32;
+		let total_size = ram_size + rom_size;
 		let mut cpu = CPU {
 			d: [0; 8],
 			a: [0; 8],
 			pc: 0,
-			sr: 0x2700, // Supervisor mode, interrupt mask 7
-			memory: Memory::new(memory_size),
+			sr: 0x2700,
+			memory, // Move happens here
 			cycle_count: 0,
 			pending_interrupts: Vec::new(),
 			interrupt_ack: None,
@@ -241,15 +204,62 @@ impl CPU {
 			halted: false,
 			prefetch_queue: [0; 2],
 		};
-		cpu.a[7] = (memory_size - 4) as u32; // Stack pointer at top of memory
-		cpu.prefetch(); // Initial prefetch
+		cpu.a[7] = total_size - 4; // Set stack pointer
 		cpu
 	}
 
-    /// Prefetch two words into the queue
-    fn prefetch(&mut self) {
-        self.prefetch_queue[0] = self.memory.read_word(self.pc);
-        self.prefetch_queue[1] = self.memory.read_word(self.pc + 2);
+    fn cpu_read_byte(&mut self, address: u32) -> u8 {
+		match self.memory.read_byte(address) {
+			Ok(value) => value,
+			Err(Exception::AddressError) => {
+				self.trigger_exception(3);
+				0 // Or some default value
+			}
+		}
+	}
+
+    fn cpu_read_word(&mut self, address: u32) -> u16 {
+		match self.memory.read_word(address) {
+			Ok(value) => value,
+			Err(Exception::AddressError) => {
+				self.trigger_exception(3);
+				0
+			}
+		}
+	}
+
+    fn cpu_read_long(&mut self, address: u32) -> u32 {
+		match self.memory.read_long(address) {
+			Ok(value) => value,
+			Err(Exception::AddressError) => {
+				self.trigger_exception(3);  // Assuming this method exists
+				0  // Default return value
+			}
+		}
+	}
+
+    fn cpu_write_byte(&mut self, address: u32, value: u8) {
+		if let Err(Exception::AddressError) = self.memory.write_byte(address, value) {
+			self.trigger_exception(3);
+		}
+	}
+
+    fn cpu_write_word(&mut self, address: u32, value: u16) {
+		if let Err(Exception::AddressError) = self.memory.write_word(address, value) {
+			self.trigger_exception(3);
+		}
+	}
+
+    fn cpu_write_long(&mut self, address: u32, value: u32) {
+		if let Err(Exception::AddressError) = self.memory.write_long(address, value) {
+			self.trigger_exception(3);
+		}
+	}
+
+	/// Prefetch two words into the queue
+    pub fn prefetch(&mut self) {
+        self.prefetch_queue[0] = self.cpu_read_word(self.pc);
+        self.prefetch_queue[1] = self.cpu_read_word(self.pc + 2);
         self.pc += 4; // Advance PC past prefetched words
     }
 
@@ -257,7 +267,7 @@ impl CPU {
     fn fetch_word(&mut self) -> u16 {
         let word = self.prefetch_queue[0];
         self.prefetch_queue[0] = self.prefetch_queue[1];
-        self.prefetch_queue[1] = self.memory.read_word(self.pc);
+        self.prefetch_queue[1] = self.cpu_read_word(self.pc);
         self.pc += 2;
         word
     }
@@ -270,12 +280,13 @@ impl CPU {
     }
 
     /// Set status flags (Negative, Zero, Overflow, Carry)
-    fn set_flags(&mut self, n: bool, z: bool, v: bool, c: bool) {
+    fn set_flags(&mut self, n: bool, z: bool, v: bool, c: bool, x: bool) {
         let mut sr = self.sr & 0xFFF0; // Preserve non-flag bits
         if n { sr |= 0x8; } // Negative
         if z { sr |= 0x4; } // Zero
         if v { sr |= 0x2; } // Overflow
         if c { sr |= 0x1; } // Carry
+		if x { sr |= 0x10; } // Extend
         self.sr = sr;
     }
 
@@ -284,7 +295,7 @@ impl CPU {
         match operand {
             Operand::DataRegister(_) => 0,
             Operand::AddressRegister(_) => 0,
-            Operand::Indirect(reg) => match size {
+            Operand::Indirect(_reg) => match size {
                 Size::Byte | Size::Word => 4,
                 Size::Long => 8,
             },
@@ -337,10 +348,10 @@ impl CPU {
     fn check_supervisor(&mut self) -> bool {
         if (self.sr & 0x2000) == 0 { // S bit (bit 13) clear = user mode
             self.a[7] -= 4;
-            self.memory.write_long(self.a[7], self.pc); // Push PC
+            self.cpu_write_long(self.a[7], self.pc); // Push PC
             self.a[7] -= 2;
-            self.memory.write_word(self.a[7], self.sr); // Push SR
-            self.pc = self.memory.read_long(32); // Vector 8: Privilege Violation
+            self.cpu_write_word(self.a[7], self.sr); // Push SR
+            self.pc = self.cpu_read_long(32); // Vector 8: Privilege Violation
             false
         } else {
             true
@@ -353,7 +364,7 @@ impl CPU {
             return;
         }
         if let Some(v) = vector {
-            if v < 2 || v > 255 { // Vectors 0-1 reserved, 2-255 valid
+            if v < 2 { // Vectors 0-1 reserved, 2-255 valid
                 return;
             }
         }
@@ -394,13 +405,14 @@ impl CPU {
 
         // Step 4: Push SR and PC (5n = 10 cycles)
         self.a[7] -= 2;
-        self.memory.write_word(self.a[7], self.sr);
+        self.cpu_write_word(self.a[7], self.sr);
         self.a[7] -= 4;
-        self.memory.write_long(self.a[7], self.pc);
+        self.cpu_write_long(self.a[7], self.pc);
         cycles += 10;
 
         // Step 5: Fetch vector (2n = 4 cycles)
-        self.pc = self.memory.read_long(vec_addr * 4);
+        self.pc = self.cpu_read_long(vec_addr * 4);
+		self.prefetch();
         cycles += 4;
 
         // Step 6: Complete IACK cycle (1n = 2 cycles)
@@ -409,15 +421,16 @@ impl CPU {
         self.prefetch(); // Refill prefetch queue after interrupt
         cycles
     }
-	
+
 	/// Trigger an exception with the given vector, return cycles taken
-    fn trigger_exception(&mut self, vector: u32) -> u32 {
+    pub fn trigger_exception(&mut self, vector: u32) -> u32 {
         self.sr |= 0x2000; // Enter supervisor mode
         self.a[7] -= 2;
-        self.memory.write_word(self.a[7], self.sr); // Push SR
+        self.cpu_write_word(self.a[7], self.sr); // Push SR
         self.a[7] -= 4;
-        self.memory.write_long(self.a[7], self.pc); // Push PC
-        self.pc = self.memory.read_long(vector * 4); // Vector address
+        self.cpu_write_long(self.a[7], self.pc); // Push PC
+        self.pc = self.cpu_read_long(vector * 4); // Vector address
+		self.prefetch();
         34 // Exception timing (17n)
     }
 
@@ -443,7 +456,7 @@ impl CPU {
                 let disp = (ext as i8) as i8;
                 let index_reg = (ext >> 12) & 0x7;
                 let index_size = if (ext & 0x800) != 0 { Size::Long } else { Size::Word };
-                Operand::Indexed(reg, disp, index_reg, index_size)
+                Operand::Indexed(reg, disp, index_reg as u8, index_size)
             }
             7 => match reg {
                 0 => Operand::AbsoluteShort(self.fetch_word() as u32),
@@ -457,7 +470,7 @@ impl CPU {
                     let disp = (ext as i8) as i8;
                     let index_reg = (ext >> 12) & 0x7;
                     let index_size = if (ext & 0x800) != 0 { Size::Long } else { Size::Word };
-                    Operand::PCIndexed(disp, index_reg, index_size)
+                    Operand::PCIndexed(disp, index_reg as u8, index_size)
                 }
                 4 => {
                     let value = match size {
@@ -481,17 +494,17 @@ impl CPU {
             Operand::Indirect(reg) => {
                 let addr = self.a[*reg as usize];
                 match size {
-                    Size::Byte => self.memory.read_byte(addr) as u32,
-                    Size::Word => self.memory.read_word(addr) as u32,
-                    Size::Long => self.memory.read_long(addr),
+                    Size::Byte => self.cpu_read_byte(addr) as u32,
+                    Size::Word => self.cpu_read_word(addr) as u32,
+                    Size::Long => self.cpu_read_long(addr),
                 }
             }
             Operand::PostInc(reg) => {
                 let addr = self.a[*reg as usize];
                 let value = match size {
-                    Size::Byte => self.memory.read_byte(addr) as u32,
-                    Size::Word => self.memory.read_word(addr) as u32,
-                    Size::Long => self.memory.read_long(addr),
+                    Size::Byte => self.cpu_read_byte(addr) as u32,
+                    Size::Word => self.cpu_read_word(addr) as u32,
+                    Size::Long => self.cpu_read_long(addr),
                 };
                 self.a[*reg as usize] += size.bits() / 8;
                 value
@@ -500,17 +513,17 @@ impl CPU {
                 self.a[*reg as usize] -= size.bits() / 8;
                 let addr = self.a[*reg as usize];
                 match size {
-                    Size::Byte => self.memory.read_byte(addr) as u32,
-                    Size::Word => self.memory.read_word(addr) as u32,
-                    Size::Long => self.memory.read_long(addr),
+                    Size::Byte => self.cpu_read_byte(addr) as u32,
+                    Size::Word => self.cpu_read_word(addr) as u32,
+                    Size::Long => self.cpu_read_long(addr),
                 }
             }
             Operand::Displacement(reg, disp) => {
                 let addr = self.a[*reg as usize].wrapping_add(*disp as u32);
                 match size {
-                    Size::Byte => self.memory.read_byte(addr) as u32,
-                    Size::Word => self.memory.read_word(addr) as u32,
-                    Size::Long => self.memory.read_long(addr),
+                    Size::Byte => self.cpu_read_byte(addr) as u32,
+                    Size::Word => self.cpu_read_word(addr) as u32,
+                    Size::Long => self.cpu_read_long(addr),
                 }
             }
             Operand::Indexed(reg, disp, idx_reg, idx_size) => {
@@ -522,27 +535,27 @@ impl CPU {
                 };
                 let addr = base.wrapping_add(*disp as i32 as u32).wrapping_add(index as u32);
                 match size {
-                    Size::Byte => self.memory.read_byte(addr) as u32,
-                    Size::Word => self.memory.read_word(addr) as u32,
-                    Size::Long => self.memory.read_long(addr),
+                    Size::Byte => self.cpu_read_byte(addr) as u32,
+                    Size::Word => self.cpu_read_word(addr) as u32,
+                    Size::Long => self.cpu_read_long(addr),
                 }
             }
             Operand::AbsoluteShort(addr) => match size {
-                Size::Byte => self.memory.read_byte(*addr) as u32,
-                Size::Word => self.memory.read_word(*addr) as u32,
-                Size::Long => self.memory.read_long(*addr),
+                Size::Byte => self.cpu_read_byte(*addr) as u32,
+                Size::Word => self.cpu_read_word(*addr) as u32,
+                Size::Long => self.cpu_read_long(*addr),
             },
             Operand::AbsoluteLong(addr) => match size {
-                Size::Byte => self.memory.read_byte(*addr) as u32,
-                Size::Word => self.memory.read_word(*addr) as u32,
-                Size::Long => self.memory.read_long(*addr),
+                Size::Byte => self.cpu_read_byte(*addr) as u32,
+                Size::Word => self.cpu_read_word(*addr) as u32,
+                Size::Long => self.cpu_read_long(*addr),
             },
             Operand::PCDisplacement(disp) => {
                 let addr = self.pc.wrapping_add(*disp as u32 - 2); // -2 adjusts for prefetch
                 match size {
-                    Size::Byte => self.memory.read_byte(addr) as u32,
-                    Size::Word => self.memory.read_word(addr) as u32,
-                    Size::Long => self.memory.read_long(addr),
+                    Size::Byte => self.cpu_read_byte(addr) as u32,
+                    Size::Word => self.cpu_read_word(addr) as u32,
+                    Size::Long => self.cpu_read_long(addr),
                 }
             }
             Operand::PCIndexed(disp, idx_reg, idx_size) => {
@@ -554,9 +567,9 @@ impl CPU {
                 };
                 let addr = base.wrapping_add(*disp as i32 as u32).wrapping_add(index as u32);
                 match size {
-                    Size::Byte => self.memory.read_byte(addr) as u32,
-                    Size::Word => self.memory.read_word(addr) as u32,
-                    Size::Long => self.memory.read_long(addr),
+                    Size::Byte => self.cpu_read_byte(addr) as u32,
+                    Size::Word => self.cpu_read_word(addr) as u32,
+                    Size::Long => self.cpu_read_long(addr),
                 }
             }
             Operand::Immediate(val) => *val & size.mask(),
@@ -571,17 +584,17 @@ impl CPU {
             Operand::Indirect(reg) => {
                 let addr = self.a[*reg as usize];
                 match size {
-                    Size::Byte => self.memory.write_byte(addr, value as u8),
-                    Size::Word => self.memory.write_word(addr, value as u16),
-                    Size::Long => self.memory.write_long(addr, value),
+                    Size::Byte => self.cpu_write_byte(addr, value as u8),
+                    Size::Word => self.cpu_write_word(addr, value as u16),
+                    Size::Long => self.cpu_write_long(addr, value),
                 }
             }
             Operand::PostInc(reg) => {
                 let addr = self.a[*reg as usize];
                 match size {
-                    Size::Byte => self.memory.write_byte(addr, value as u8),
-                    Size::Word => self.memory.write_word(addr, value as u16),
-                    Size::Long => self.memory.write_long(addr, value),
+                    Size::Byte => self.cpu_write_byte(addr, value as u8),
+                    Size::Word => self.cpu_write_word(addr, value as u16),
+                    Size::Long => self.cpu_write_long(addr, value),
                 }
                 self.a[*reg as usize] += size.bits() / 8;
             }
@@ -589,17 +602,17 @@ impl CPU {
                 self.a[*reg as usize] -= size.bits() / 8;
                 let addr = self.a[*reg as usize];
                 match size {
-                    Size::Byte => self.memory.write_byte(addr, value as u8),
-                    Size::Word => self.memory.write_word(addr, value as u16),
-                    Size::Long => self.memory.write_long(addr, value),
+                    Size::Byte => self.cpu_write_byte(addr, value as u8),
+                    Size::Word => self.cpu_write_word(addr, value as u16),
+                    Size::Long => self.cpu_write_long(addr, value),
                 }
             }
             Operand::Displacement(reg, disp) => {
                 let addr = self.a[*reg as usize].wrapping_add(*disp as u32);
                 match size {
-                    Size::Byte => self.memory.write_byte(addr, value as u8),
-                    Size::Word => self.memory.write_word(addr, value as u16),
-                    Size::Long => self.memory.write_long(addr, value),
+                    Size::Byte => self.cpu_write_byte(addr, value as u8),
+                    Size::Word => self.cpu_write_word(addr, value as u16),
+                    Size::Long => self.cpu_write_long(addr, value),
                 }
             }
             Operand::Indexed(reg, disp, idx_reg, idx_size) => {
@@ -611,29 +624,32 @@ impl CPU {
                 };
                 let addr = base.wrapping_add(*disp as i32 as u32).wrapping_add(index as u32);
                 match size {
-                    Size::Byte => self.memory.write_byte(addr, value as u8),
-                    Size::Word => self.memory.write_word(addr, value as u16),
-                    Size::Long => self.memory.write_long(addr, value),
+                    Size::Byte => self.cpu_write_byte(addr, value as u8),
+                    Size::Word => self.cpu_write_word(addr, value as u16),
+                    Size::Long => self.cpu_write_long(addr, value),
                 }
             }
             Operand::AbsoluteShort(addr) => match size {
-                Size::Byte => self.memory.write_byte(*addr, value as u8),
-                Size::Word => self.memory.write_word(*addr, value as u16),
-                Size::Long => self.memory.write_long(*addr, value),
+                Size::Byte => self.cpu_write_byte(*addr, value as u8),
+                Size::Word => self.cpu_write_word(*addr, value as u16),
+                Size::Long => self.cpu_write_long(*addr, value),
             },
             Operand::AbsoluteLong(addr) => match size {
-                Size::Byte => self.memory.write_byte(*addr, value as u8),
-                Size::Word => self.memory.write_word(*addr, value as u16),
-                Size::Long => self.memory.write_long(*addr, value),
+                Size::Byte => self.cpu_write_byte(*addr, value as u8),
+                Size::Word => self.cpu_write_word(*addr, value as u16),
+                Size::Long => self.cpu_write_long(*addr, value),
             },
             _ => panic!("Cannot write to operand: {:?}", operand),
         }
     }
 
     /// Decode an instruction from memory
+//	const OPCODE_TABLE: [fn(&mut CPU) -> Instruction; 65536] = [/* populate */];
 	fn decode(&mut self) -> Instruction {
 		let opcode = self.fetch_word();
+//		OPCODE_TABLE[opcode as usize](self)
 		match opcode {
+			// Exact single opcodes first
 			0x4E71 => Instruction {
 				operation: Operation::Nop,
 				size: None,
@@ -646,26 +662,660 @@ impl CPU {
 				src: None,
 				dst: None,
 			},
-			0x1000..=0x3FFF => { // MOVE.B, MOVE.W, MOVE.L
-				let size = match (opcode >> 12) & 0x3 {
-					1 => Size::Byte,
-					3 => Size::Word,
-					2 => Size::Long,
-					_ => unreachable!(),
-				};
-				let dst_reg = ((opcode >> 9) & 0x7) as u8;
-				let dst_mode = ((opcode >> 6) & 0x7) as u8;
-				let src_mode = ((opcode >> 3) & 0x7) as u8;
-				let src_reg = (opcode & 0x7) as u8;
-				let src = self.decode_ea(src_mode, src_reg, size);
-				let dst = self.decode_ea(dst_mode, dst_reg, size);
+			0x4E72 => { // STOP #<data> (Note: also used for NopAlt in your code; clarify intent)
+				let data = self.fetch_word() as u32;
 				Instruction {
-					operation: Operation::Move,
+					operation: Operation::Stop,
+					size: None,
+					src: Some(Operand::Immediate(data)),
+					dst: None,
+				}
+			},
+			0x4E74 => {
+				let disp = self.fetch_word() as i16 as i32;
+				Instruction {
+					operation: Operation::Rtd,
+					size: None,
+					src: Some(Operand::Immediate(disp as u32)),
+					dst: None,
+				}
+			},
+			0x4E76 => {
+				Instruction {
+					operation: Operation::Trapv,
+					size: None,
+					src: None,
+					dst: None,
+				}
+			},
+			0x4E70 => {
+				Instruction {
+					operation: Operation::Reset,
+					size: None,
+					src: None,
+					dst: None,
+				}
+			},
+			0x4E73 => {
+				Instruction {
+					operation: Operation::Rte,
+					size: None,
+					src: None,
+					dst: None,
+				}
+			},
+			0x023C => {
+				let immediate = self.fetch_word() as u32 & 0xFF;
+				Instruction {
+					operation: Operation::AndiCcr,
+					size: Some(Size::Byte),
+					src: Some(Operand::Immediate(immediate)),
+					dst: None,
+				}
+			},
+			0x003C => {
+				let immediate = self.fetch_word() as u32 & 0xFF;
+				Instruction {
+					operation: Operation::OriCcr,
+					size: Some(Size::Byte),
+					src: Some(Operand::Immediate(immediate)),
+					dst: None,
+				}
+			},
+			0x0A3C => {
+				let immediate = self.fetch_word() as u32 & 0xFF;
+				Instruction {
+					operation: Operation::EoriCcr,
+					size: Some(Size::Byte),
+					src: Some(Operand::Immediate(immediate)),
+					dst: None,
+				}
+			},
+			0x4AFC => {
+				let mode = ((opcode >> 3) & 0x7) as u8;
+				let reg = (opcode & 0x7) as u8;
+				let dst = self.decode_ea(mode, reg, Size::Byte);
+				Instruction {
+					operation: Operation::TasMem,
+					size: Some(Size::Byte),
+					src: None,
+					dst: Some(dst),
+				}
+			},
+
+			// Specific ranges with conditions
+			0x0188..=0x07C8 if (opcode & 0xF138) == 0x0108 => { // MOVEP
+				let direction = (opcode >> 7) & 0x1; // 0: memory to reg, 1: reg to memory
+				let size = if (opcode >> 6) & 0x1 == 0 { Size::Word } else { Size::Long };
+				let dreg = ((opcode >> 9) & 0x7) as u8;
+				let areg = (opcode & 0x7) as u8;
+				let _displacement = self.fetch_word() as i16;
+				let (src, dst) = if direction == 0 {
+					let ea = self.decode_ea(5, areg, size); // Displacement mode
+					(ea, Operand::DataRegister(dreg))
+				} else {
+					let ea = self.decode_ea(5, areg, size); // Displacement mode
+					(Operand::DataRegister(dreg), ea)
+				};
+				Instruction {
+					operation: Operation::Movep,
 					size: Some(size),
 					src: Some(src),
 					dst: Some(dst),
 				}
-			}
+			},
+			0x0880..=0x08FF => { // BCLR #<data>,<ea>
+				let bit_number = self.fetch_word() as u8;
+				let ea_mode = ((opcode >> 3) & 0x7) as u8;
+				let ea_reg = (opcode & 0x7) as u8;
+				let size = if ea_mode == 0 { Size::Long } else { Size::Byte }; // Long for Dn, Byte for memory
+				let dst = self.decode_ea(ea_mode, ea_reg, size);
+				Instruction {
+					operation: Operation::Bclr,
+					size: Some(size),
+					src: Some(Operand::Immediate(bit_number as u32)),
+					dst: Some(dst),
+				}
+			},
+			0x41C0..=0x4FFF if (opcode & 0xF1C0) == 0x41C0 => { // LEA <ea>,An
+				let areg = ((opcode >> 9) & 0x7) as u8;
+				let ea_mode = ((opcode >> 3) & 0x7) as u8;
+				let ea_reg = (opcode & 0x7) as u8;
+				let src = self.decode_ea(ea_mode, ea_reg, Size::Long);
+				Instruction {
+					operation: Operation::Lea,
+					size: Some(Size::Long),
+					src: Some(src),
+					dst: Some(Operand::AddressRegister(areg)),
+				}
+			},
+			0x4880..=0x48C0 if (opcode & 0xFF38) == 0x4800 => { // EXT.<size> Dn
+				let size = if (opcode & 0x0040) == 0 { Size::Word } else { Size::Long };
+				let reg = (opcode & 0x7) as u8;
+				Instruction {
+					operation: Operation::Ext,
+					size: Some(size),
+					src: None,
+					dst: Some(Operand::DataRegister(reg)),
+				}
+			},
+			0xB0C0..=0xBFC0 if (opcode & 0xF1C0) == 0xB0C0 => { // CMPA.<size> <ea>,An
+				let an = ((opcode >> 9) & 0x7) as u8;
+				let size = if (opcode & 0x0100) != 0 { Size::Long } else { Size::Word };
+				let mode = ((opcode >> 3) & 0x7) as u8;
+				let reg = (opcode & 0x7) as u8;
+				let src = self.decode_ea(mode, reg, size);
+				Instruction {
+					operation: Operation::Cmpa,
+					size: Some(size),
+					src: Some(src),
+					dst: Some(Operand::AddressRegister(an)),
+				}
+			},
+			0xE510..=0xE57F => { // ROXL.<size> Dx,Dy or #<data>,Dy
+				let size = match (opcode >> 6) & 0x3 {
+					0 => Size::Byte,
+					1 => Size::Word,
+					2 => Size::Long,
+					_ => unreachable!(),
+				};
+				let count_reg = ((opcode >> 9) & 0x7) as u8;
+				let dr = (opcode >> 5) & 0x1; // 0: immediate, 1: register
+				let dst_reg = (opcode & 0x7) as u8;
+				let src = if dr == 0 {
+					Operand::Immediate(if count_reg == 0 { 8 } else { count_reg as u32 })
+				} else {
+					Operand::DataRegister(count_reg)
+				};
+				Instruction {
+					operation: Operation::Roxl,
+					size: Some(size),
+					src: Some(src),
+					dst: Some(Operand::DataRegister(dst_reg)),
+				}
+			},
+			0x4E80..=0x4EBC => { // JSR <ea>
+				let mode = ((opcode >> 3) & 0x7) as u8;
+				let reg = (opcode & 0x7) as u8;
+				let src = self.decode_ea(mode, reg, Size::Long);
+				Instruction {
+					operation: Operation::Jsr,
+					size: None,
+					src: Some(src),
+					dst: None,
+				}
+			},
+			0x0140..=0x017F => { // BCHG Dn,<ea>
+				let size = if (opcode & 0x0038) == 0 { Size::Long } else { Size::Byte };
+				let dn = ((opcode >> 9) & 0x7) as u8;
+				let mode = ((opcode >> 3) & 0x7) as u8;
+				let reg = (opcode & 0x7) as u8;
+				let dst = self.decode_ea(mode, reg, size);
+				Instruction {
+					operation: Operation::Bchg,
+					size: Some(size),
+					src: Some(Operand::DataRegister(dn)),
+					dst: Some(dst),
+				}
+			},
+			0x01C0..=0x01FF => { // BSET Dn,<ea>
+				let size = if (opcode & 0x0038) == 0 { Size::Long } else { Size::Byte };
+				let dn = ((opcode >> 9) & 0x7) as u8;
+				let mode = ((opcode >> 3) & 0x7) as u8;
+				let reg = (opcode & 0x7) as u8;
+				let dst = self.decode_ea(mode, reg, size);
+				Instruction {
+					operation: Operation::Bset,
+					size: Some(size),
+					src: Some(Operand::DataRegister(dn)),
+					dst: Some(dst),
+				}
+			},
+			0x0100..=0x013F => { // BTST Dn,<ea>
+				let size = if (opcode & 0x0038) == 0 { Size::Long } else { Size::Byte };
+				let dn = ((opcode >> 9) & 0x7) as u8;
+				let mode = ((opcode >> 3) & 0x7) as u8;
+				let reg = (opcode & 0x7) as u8;
+				let dst = self.decode_ea(mode, reg, size);
+				Instruction {
+					operation: Operation::Btst,
+					size: Some(size),
+					src: Some(Operand::DataRegister(dn)),
+					dst: Some(dst),
+				}
+			},
+			0x4E40..=0x4E4F => { // TRAP #vector
+				let vector = (opcode & 0xF) as u32;
+				Instruction {
+					operation: Operation::Trap,
+					size: None,
+					src: Some(Operand::Immediate(vector)),
+					dst: None,
+				}
+			},
+			0x8000..=0x81F0 => { // OR.<size> <ea>,Dn
+				let dn = ((opcode >> 9) & 0x7) as u8;
+				let size = match (opcode >> 6) & 0x3 {
+					0 => Size::Byte,
+					1 => Size::Word,
+					2 => Size::Long,
+					_ => unreachable!(),
+				};
+				let mode = ((opcode >> 3) & 0x7) as u8;
+				let reg = (opcode & 0x7) as u8;
+				let src = self.decode_ea(mode, reg, size);
+				Instruction {
+					operation: Operation::Or,
+					size: Some(size),
+					src: Some(src),
+					dst: Some(Operand::DataRegister(dn)),
+				}
+			},
+			0x4600..=0x46FC => { // NOT.<size> <ea>
+				let size = match (opcode >> 6) & 0x3 {
+					0 => Size::Byte,
+					1 => Size::Word,
+					2 => Size::Long,
+					_ => unreachable!(),
+				};
+				let mode = ((opcode >> 3) & 0x7) as u8;
+				let reg = (opcode & 0x7) as u8;
+				let dst = self.decode_ea(mode, reg, size);
+				Instruction {
+					operation: Operation::Not,
+					size: Some(size),
+					src: None,
+					dst: Some(dst),
+				}
+			},
+			0x81C0..=0x81FF => { // DIVS.W <ea>,Dn
+				let dn = ((opcode >> 9) & 0x7) as u8;
+				let mode = ((opcode >> 3) & 0x7) as u8;
+				let reg = (opcode & 0x7) as u8;
+				let src = self.decode_ea(mode, reg, Size::Word);
+				Instruction {
+					operation: Operation::Divs,
+					size: Some(Size::Word),
+					src: Some(src),
+					dst: Some(Operand::DataRegister(dn)),
+				}
+			},
+			0xE410..=0xE47F => { // ROXR.<size> Dx,Dy or #<data>,Dy
+				let size = match (opcode >> 6) & 0x3 {
+					0 => Size::Byte,
+					1 => Size::Word,
+					2 => Size::Long,
+					_ => unreachable!(),
+				};
+				let count_reg = ((opcode >> 9) & 0x7) as u8;
+				let dr = (opcode >> 5) & 0x1; // 0: immediate, 1: register
+				let dst_reg = (opcode & 0x7) as u8;
+				let src = if dr == 0 {
+					Operand::Immediate(if count_reg == 0 { 8 } else { count_reg as u32 })
+				} else {
+					Operand::DataRegister(count_reg)
+				};
+				Instruction {
+					operation: Operation::Roxr,
+					size: Some(size),
+					src: Some(src),
+					dst: Some(Operand::DataRegister(dst_reg)),
+				}
+			},
+			0x4EC0..=0x4EFC => { // JMP <ea>
+				let mode = ((opcode >> 3) & 0x7) as u8;
+				let reg = (opcode & 0x7) as u8;
+				let src = self.decode_ea(mode, reg, Size::Long);
+				Instruction {
+					operation: Operation::Jmp,
+					size: None,
+					src: Some(src),
+					dst: None,
+				}
+			},
+			0xB000..=0xB1F0 => { // CMP.<size> <ea>,Dn
+				let dn = ((opcode >> 9) & 0x7) as u8;
+				let size = match (opcode >> 6) & 0x3 {
+					0 => Size::Byte,
+					1 => Size::Word,
+					2 => Size::Long,
+					_ => unreachable!(),
+				};
+				let mode = ((opcode >> 3) & 0x7) as u8;
+				let reg = (opcode & 0x7) as u8;
+				let src = self.decode_ea(mode, reg, size);
+				Instruction {
+					operation: Operation::Cmp,
+					size: Some(size),
+					src: Some(src),
+					dst: Some(Operand::DataRegister(dn)),
+				}
+			},
+			0x4840..=0x487C if (opcode & 0xF1C0) == 0x4840 => { // PEA <ea>
+				let mode = ((opcode >> 3) & 0x7) as u8;
+				let reg = (opcode & 0x7) as u8;
+				let src = self.decode_ea(mode, reg, Size::Long);
+				Instruction {
+					operation: Operation::Pea,
+					size: None,
+					src: Some(src),
+					dst: None,
+				}
+			},
+			0x4E50..=0x4E57 => { // LINK An,#<displacement>
+				let an = (opcode & 0x7) as u8;
+				let disp = self.fetch_word() as i16 as i32;
+				Instruction {
+					operation: Operation::Link,
+					size: None,
+					src: Some(Operand::Immediate(disp as u32)),
+					dst: Some(Operand::AddressRegister(an)),
+				}
+			},
+			0x4E58..=0x4E5F => { // UNLK An
+				let an = (opcode & 0x7) as u8;
+				Instruction {
+					operation: Operation::Unlk,
+					size: None,
+					src: None,
+					dst: Some(Operand::AddressRegister(an)),
+				}
+			},
+			0x4880..=0x4BFC if (opcode & 0xFB80) == 0x4880 => { // MOVEM.<size> <ea>,reglist or reglist,<ea>
+				let direction = (opcode >> 10) & 0x1; // 0: reg to mem, 1: mem to reg
+				let size = if (opcode & 0x0040) != 0 { Size::Long } else { Size::Word };
+				let mode = ((opcode >> 3) & 0x7) as u8;
+				let reg = (opcode & 0x7) as u8;
+				let reglist = self.fetch_word();
+				let ea = self.decode_ea(mode, reg, size);
+				let (src, dst) = if direction == 0 {
+					(Operand::Immediate(reglist as u32), ea)
+				} else {
+					(ea, Operand::Immediate(reglist as u32))
+				};
+				Instruction {
+					operation: Operation::Movem,
+					size: Some(size),
+					src: Some(src),
+					dst: Some(dst),
+				}
+			},
+			0xE008..=0xE0F8 if (opcode & 0xF138) == 0xE008 => { // LSR.<size> <ea>
+				let size = match (opcode >> 6) & 0x3 {
+					0 => Size::Byte,
+					1 => Size::Word,
+					2 => Size::Long,
+					_ => unreachable!(),
+				};
+				let mode = ((opcode >> 3) & 0x7) as u8;
+				let reg = (opcode & 0x7) as u8;
+				let dst = self.decode_ea(mode, reg, size);
+				Instruction {
+					operation: Operation::LsrMem,
+					size: Some(size),
+					src: Some(Operand::Immediate(1)), // Shift by 1
+					dst: Some(dst),
+				}
+			},
+			0xE7C0..=0xE7F8 if (opcode & 0xF1C0) == 0xE7C0 => { // ROL.<size> <ea>
+				let size = match (opcode >> 6) & 0x3 {
+					0 => Size::Byte,
+					1 => Size::Word,
+					2 => Size::Long,
+					_ => unreachable!(),
+				};
+				let mode = ((opcode >> 3) & 0x7) as u8;
+				let reg = (opcode & 0x7) as u8;
+				let dst = self.decode_ea(mode, reg, size);
+				Instruction {
+					operation: Operation::RolMem,
+					size: Some(size),
+					src: Some(Operand::Immediate(1)), // Rotate by 1
+					dst: Some(dst),
+				}
+			},
+			0xE6C0..=0xE6F8 if (opcode & 0xF1C0) == 0xE6C0 => { // ROR.<size> <ea>
+				let size = match (opcode >> 6) & 0x3 {
+					0 => Size::Byte,
+					1 => Size::Word,
+					2 => Size::Long,
+					_ => unreachable!(),
+				};
+				let mode = ((opcode >> 3) & 0x7) as u8;
+				let reg = (opcode & 0x7) as u8;
+				let dst = self.decode_ea(mode, reg, size);
+				Instruction {
+					operation: Operation::RorMem,
+					size: Some(size),
+					src: Some(Operand::Immediate(1)), // Rotate by 1
+					dst: Some(dst),
+				}
+			},
+			0x0400..=0x04FC => { // SUBI.<size> #<data>,<ea>
+				let size = match (opcode >> 6) & 0x3 {
+					0 => Size::Byte,
+					1 => Size::Word,
+					2 => Size::Long,
+					_ => unreachable!(),
+				};
+				let ea_mode = ((opcode >> 3) & 0x7) as u8;
+				let ea_reg = (opcode & 0x7) as u8;
+				let immediate = match size {
+					Size::Byte => self.fetch_word() as u32 & 0xFF,
+					Size::Word => self.fetch_word() as u32,
+					Size::Long => self.fetch_long(),
+				};
+				let dst = self.decode_ea(ea_mode, ea_reg, size);
+				Instruction {
+					operation: Operation::Subi,
+					size: Some(size),
+					src: Some(Operand::Immediate(immediate)),
+					dst: Some(dst),
+				}
+			},
+			0x4800..=0x483C => { // NBCD <ea>
+				let mode = ((opcode >> 3) & 0x7) as u8;
+				let reg = (opcode & 0x7) as u8;
+				let dst = self.decode_ea(mode, reg, Size::Byte);
+				Instruction {
+					operation: Operation::Nbcd,
+					size: Some(Size::Byte),
+					src: None,
+					dst: Some(dst),
+				}
+			},
+			0x0600..=0x06FC => { // ADDI.<size> #<data>,<ea>
+				let size = match (opcode >> 6) & 0x3 {
+					0 => Size::Byte,
+					1 => Size::Word,
+					2 => Size::Long,
+					_ => unreachable!(),
+				};
+				let ea_mode = ((opcode >> 3) & 0x7) as u8;
+				let ea_reg = (opcode & 0x7) as u8;
+				let immediate = match size {
+					Size::Byte => self.fetch_word() as u32 & 0xFF,
+					Size::Word => self.fetch_word() as u32,
+					Size::Long => self.fetch_long(),
+				};
+				let dst = self.decode_ea(ea_mode, ea_reg, size);
+				Instruction {
+					operation: Operation::Addi,
+					size: Some(size),
+					src: Some(Operand::Immediate(immediate)),
+					dst: Some(dst),
+				}
+			},
+			0xE5C0..=0xE5F8 if (opcode & 0xF1C0) == 0xE5C0 => { // ROXL.<size> <ea>
+				let size = match (opcode >> 6) & 0x3 {
+					0 => Size::Byte,
+					1 => Size::Word,
+					2 => Size::Long,
+					_ => unreachable!(),
+				};
+				let mode = ((opcode >> 3) & 0x7) as u8;
+				let reg = (opcode & 0x7) as u8;
+				let dst = self.decode_ea(mode, reg, size);
+				Instruction {
+					operation: Operation::RoxlMem,
+					size: Some(size),
+					src: Some(Operand::Immediate(1)), // Rotate by 1
+					dst: Some(dst),
+				}
+			},
+			0xE4C0..=0xE4F8 if (opcode & 0xF1C0) == 0xE4C0 => { // ROXR.<size> <ea>
+				let size = match (opcode >> 6) & 0x3 {
+					0 => Size::Byte,
+					1 => Size::Word,
+					2 => Size::Long,
+					_ => unreachable!(),
+				};
+				let mode = ((opcode >> 3) & 0x7) as u8;
+				let reg = (opcode & 0x7) as u8;
+				let dst = self.decode_ea(mode, reg, size);
+				Instruction {
+					operation: Operation::RoxrMem,
+					size: Some(size),
+					src: Some(Operand::Immediate(1)), // Rotate by 1
+					dst: Some(dst),
+				}
+			},
+			0x42C0..=0x42FF => { // MOVE.B <ea>,CCR
+				let mode = ((opcode >> 3) & 0x7) as u8;
+				let reg = (opcode & 0x7) as u8;
+				let src = self.decode_ea(mode, reg, Size::Byte);
+				Instruction {
+					operation: Operation::MoveCcr,
+					size: Some(Size::Byte),
+					src: Some(src),
+					dst: None,
+				}
+			},
+			0x46C0..=0x46FF => { // MOVE.W <ea>,SR
+				let mode = ((opcode >> 3) & 0x7) as u8;
+				let reg = (opcode & 0x7) as u8;
+				let src = self.decode_ea(mode, reg, Size::Word);
+				Instruction {
+					operation: Operation::MoveSr,
+					size: Some(Size::Word),
+					src: Some(src),
+					dst: None,
+				}
+			},
+			0x4E60..=0x4E67 => { // MOVE USP,An or MOVE An,USP
+				let direction = (opcode >> 3) & 0x1; // 0: USP to An, 1: An to USP
+				let an = (opcode & 0x7) as u8;
+				let (src, dst) = if direction == 0 {
+					(Operand::Immediate(0), Operand::AddressRegister(an)) // USP as src not directly addressable here
+				} else {
+					(Operand::AddressRegister(an), Operand::Immediate(0)) // USP as dst
+				};
+				Instruction {
+					operation: Operation::MoveUsp,
+					size: Some(Size::Long),
+					src: Some(src),
+					dst: Some(dst),
+				}
+			},
+			0xE3C0..=0xE3F8 if (opcode & 0xF1C0) == 0xE3C0 => { // LSL.<size> <ea>
+				let size = match (opcode >> 6) & 0x3 {
+					0 => Size::Byte,
+					1 => Size::Word,
+					2 => Size::Long,
+					_ => unreachable!(),
+				};
+				let mode = ((opcode >> 3) & 0x7) as u8;
+				let reg = (opcode & 0x7) as u8;
+				let dst = self.decode_ea(mode, reg, size);
+				Instruction {
+					operation: Operation::LslMem,
+					size: Some(size),
+					src: Some(Operand::Immediate(1)), // Shift by 1
+					dst: Some(dst),
+				}
+			},
+			0xE000..=0xE07F if (opcode & 0xFEE0) == 0xE000 => { // ASR.<size> Dx,Dy or #<data>,Dy
+				let size = match (opcode >> 6) & 0x3 {
+					0 => Size::Byte,
+					1 => Size::Word,
+					2 => Size::Long,
+					_ => unreachable!(),
+				};
+				let count = ((opcode >> 9) & 0x7) as u8;
+				let dr = (opcode >> 5) & 0x1; // 0: immediate, 1: register
+				let dst_reg = (opcode & 0x7) as u8;
+				let src = if dr == 0 {
+					Operand::Immediate(if count == 0 { 8 } else { count as u32 })
+				} else {
+					Operand::DataRegister(count)
+				};
+				Instruction {
+					operation: Operation::Asr,
+					size: Some(size),
+					src: Some(src),
+					dst: Some(Operand::DataRegister(dst_reg)),
+				}
+			},
+			0xE018..=0xE07F if (opcode & 0xFEE0) == 0xE018 => { // ROR.<size> Dx,Dy or #<data>,Dy
+				let size = match (opcode >> 6) & 0x3 {
+					0 => Size::Byte,
+					1 => Size::Word,
+					2 => Size::Long,
+					_ => unreachable!(),
+				};
+				let count = ((opcode >> 9) & 0x7) as u8;
+				let dr = (opcode >> 5) & 0x1; // 0: immediate, 1: register
+				let dst_reg = (opcode & 0x7) as u8;
+				let src = if dr == 0 {
+					Operand::Immediate(if count == 0 { 8 } else { count as u32 })
+				} else {
+					Operand::DataRegister(count)
+				};
+				Instruction {
+					operation: Operation::Ror,
+					size: Some(size),
+					src: Some(src),
+					dst: Some(Operand::DataRegister(dst_reg)),
+				}
+			},
+			0xE008..=0xE07F => { // LSR.<size> Dx,Dy or #<data>,Dy
+				let size = match (opcode >> 6) & 0x3 {
+					0 => Size::Byte,
+					1 => Size::Word,
+					2 => Size::Long,
+					_ => unreachable!(),
+				};
+				let count = ((opcode >> 9) & 0x7) as u8;
+				let dr = (opcode >> 5) & 0x1; // 0: immediate, 1: register
+				let dst_reg = (opcode & 0x7) as u8;
+				let src = if dr == 0 {
+					Operand::Immediate(if count == 0 { 8 } else { count as u32 }) // 0 means 8 shifts
+				} else {
+					Operand::DataRegister(count)
+				};
+				Instruction {
+					operation: Operation::Lsr,
+					size: Some(size),
+					src: Some(src),
+					dst: Some(Operand::DataRegister(dst_reg)),
+				}
+			},
+			0xD100..=0xD1F8 if (opcode & 0xF1F8) == 0xD100 => { // ADDX.<size> Dy,Dx
+				let size = match (opcode >> 6) & 0x3 {
+					0 => Size::Byte,
+					1 => Size::Word,
+					2 => Size::Long,
+					_ => unreachable!(),
+				};
+				let dx = ((opcode >> 9) & 0x7) as u8;
+				let dy = (opcode & 0x7) as u8;
+				Instruction {
+					operation: Operation::Addx,
+					size: Some(size),
+					src: Some(Operand::DataRegister(dy)),
+					dst: Some(Operand::DataRegister(dx)),
+				}
+			},
 			0xD000..=0xDFFF => { // ADD <ea>, Dn or ADD Dn, <ea>
 				let reg = ((opcode >> 9) & 0x7) as u8;
 				let direction = (opcode >> 8) & 0x1;
@@ -690,260 +1340,24 @@ impl CPU {
 					src: Some(src),
 					dst: Some(dst),
 				}
-			}
-			0xC1C0..=0xC1FF => { // MULS.W <ea>, Dn
-				let reg = ((opcode >> 9) & 0x7) as u8;
-				let src_mode = ((opcode >> 3) & 0x7) as u8;
-				let src_reg = (opcode & 0x7) as u8;
-				let src = self.decode_ea(src_mode, src_reg, Size::Word);
-				Instruction {
-					operation: Operation::Muls,
-					size: Some(Size::Word),
-					src: Some(src),
-					dst: Some(Operand::DataRegister(reg)),
-				}
-			}
-			0x80C0..=0x80FF => { // DIVU.W <ea>, Dn
-				let reg = ((opcode >> 9) & 0x7) as u8;
-				let src_mode = ((opcode >> 3) & 0x7) as u8;
-				let src_reg = (opcode & 0x7) as u8;
-				let src = self.decode_ea(src_mode, src_reg, Size::Word);
-				Instruction {
-					operation: Operation::Divu,
-					size: Some(Size::Word),
-					src: Some(src),
-					dst: Some(Operand::DataRegister(reg)),
-				}
-			}
-			0xB100..=0xB7FF => { // EOR.B, EOR.W, EOR.L Dn, <ea>
+			},
+			0x9100..=0x91F8 if (opcode & 0xF1F8) == 0x9100 => { // SUBX.<size> Dy,Dx
 				let size = match (opcode >> 6) & 0x3 {
 					0 => Size::Byte,
 					1 => Size::Word,
 					2 => Size::Long,
 					_ => unreachable!(),
 				};
-				let reg = ((opcode >> 9) & 0x7) as u8;
-				let dst_mode = ((opcode >> 3) & 0x7) as u8;
-				let dst_reg = (opcode & 0x7) as u8;
-				let dst = self.decode_ea(dst_mode, dst_reg, size);
+				let dx = ((opcode >> 9) & 0x7) as u8;
+				let dy = (opcode & 0x7) as u8;
 				Instruction {
-					operation: Operation::Eor,
+					operation: Operation::Subx,
 					size: Some(size),
-					src: Some(Operand::DataRegister(reg)),
-					dst: Some(dst),
+					src: Some(Operand::DataRegister(dy)),
+					dst: Some(Operand::DataRegister(dx)),
 				}
-			}
-			0x4400..=0x44FF => { // NEG.B, NEG.W, NEG.L <ea>
-				let size = match (opcode >> 6) & 0x3 {
-					0 => Size::Byte,
-					1 => Size::Word,
-					2 => Size::Long,
-					_ => unreachable!(),
-				};
-				let dst_mode = ((opcode >> 3) & 0x7) as u8;
-				let dst_reg = (opcode & 0x7) as u8;
-				let dst = self.decode_ea(dst_mode, dst_reg, size);
-				Instruction {
-					operation: Operation::Neg,
-					size: Some(size),
-					src: None,
-					dst: Some(dst),
-				}
-			}
-			0x4A00..=0x4AFF => { // TST.B, TST.W, TST.L <ea>
-				let size = match (opcode >> 6) & 0x3 {
-					0 => Size::Byte,
-					1 => Size::Word,
-					2 => Size::Long,
-					_ => unreachable!(),
-				};
-				let src_mode = ((opcode >> 3) & 0x7) as u8;
-				let src_reg = (opcode & 0x7) as u8;
-				let src = self.decode_ea(src_mode, src_reg, size);
-				Instruction {
-					operation: Operation::Tst,
-					size: Some(size),
-					src: Some(src),
-					dst: None,
-				}
-			}
-			0xE008..=0xE07F => { // LSR.<size> Dx,Dy or #<data>,Dy
-				let size = match (opcode >> 6) & 0x3 {
-					0 => Size::Byte,
-					1 => Size::Word,
-					2 => Size::Long,
-					_ => unreachable!(),
-				};
-				let count = ((opcode >> 9) & 0x7) as u8;
-				let dr = (opcode >> 5) & 0x1; // 0: immediate, 1: register
-				let dst_reg = (opcode & 0x7) as u8;
-				let src = if dr == 0 {
-					Operand::Immediate(if count == 0 { 8 } else { count as u32 }) // 0 means 8 shifts
-				} else {
-					Operand::DataRegister(count)
-				};
-				Instruction {
-					operation: Operation::Lsr,
-					size: Some(size),
-					src: Some(src),
-					dst: Some(Operand::DataRegister(dst_reg)),
-				}
-			}
-			0xE100..=0xE1FF => { // ASL.<size> Dx,Dy or #<data>,Dy
-				let size = match (opcode >> 6) & 0x3 {
-					0 => Size::Byte,
-					1 => Size::Word,
-					2 => Size::Long,
-					_ => unreachable!(),
-				};
-				let count_reg = ((opcode >> 9) & 0x7) as u8;
-				let dr = (opcode >> 5) & 0x1; // 0: immediate, 1: register
-				let dst_reg = (opcode & 0x7) as u8;
-				let src = if dr == 0 {
-					Operand::Immediate(if count_reg == 0 { 8 } else { count_reg as u32 })
-				} else {
-					Operand::DataRegister(count_reg)
-				};
-				Instruction {
-					operation: Operation::Asl,
-					size: Some(size),
-					src: Some(src),
-					dst: Some(Operand::DataRegister(dst_reg)),
-				}
-			}
-			0x7000..=0x7FFF => { // MOVEQ.L #<data>, Dn
-				let reg = ((opcode >> 9) & 0x7) as u8;
-				let data = (opcode & 0xFF) as i8 as i32 as u32; // Sign-extended to 32 bits
-				Instruction {
-					operation: Operation::Moveq,
-					size: Some(Size::Long),
-					src: Some(Operand::Immediate(data)),
-					dst: Some(Operand::DataRegister(reg)),
-				}
-			}
-			0xE018..=0xE07F if (opcode & 0xFEE0) == 0xE018 => { // ROR.<size> Dx,Dy or #<data>,Dy
-				let size = match (opcode >> 6) & 0x3 {
-					0 => Size::Byte,
-					1 => Size::Word,
-					2 => Size::Long,
-					_ => unreachable!(),
-				};
-				let count = ((opcode >> 9) & 0x7) as u8;
-				let dr = (opcode >> 5) & 0x1; // 0: immediate, 1: register
-				let dst_reg = (opcode & 0x7) as u8;
-				let src = if dr == 0 {
-					Operand::Immediate(if count == 0 { 8 } else { count as u32 })
-				} else {
-					Operand::DataRegister(count)
-				};
-				Instruction {
-					operation: Operation::Ror,
-					size: Some(size),
-					src: Some(src),
-					dst: Some(Operand::DataRegister(dst_reg)),
-				}
-			}
-			0x0A00..=0x0AFC => { // EORI #<data>,<ea>
-				let size = match (opcode >> 6) & 0x3 {
-					0 => Size::Byte,
-					1 => Size::Word,
-					2 => Size::Long,
-					_ => unreachable!(),
-				};
-				let ea_mode = ((opcode >> 3) & 0x7) as u8;
-				let ea_reg = (opcode & 0x7) as u8;
-				let immediate = match size {
-					Size::Byte => self.fetch_word() as u32 & 0xFF,
-					Size::Word => self.fetch_word() as u32,
-					Size::Long => self.fetch_long(),
-				};
-				let dst = self.decode_ea(ea_mode, ea_reg, size);
-				Instruction {
-					operation: Operation::Eori,
-					size: Some(size),
-					src: Some(Operand::Immediate(immediate)),
-					dst: Some(dst),
-				}
-			}
-			0x0C00..=0x0CFC => { // CMPI #<data>,<ea>
-				let size = match (opcode >> 6) & 0x3 {
-					0 => Size::Byte,
-					1 => Size::Word,
-					2 => Size::Long,
-					_ => unreachable!(),
-				};
-				let ea_mode = ((opcode >> 3) & 0x7) as u8;
-				let ea_reg = (opcode & 0x7) as u8;
-				let immediate = match size {
-					Size::Byte => self.fetch_word() as u32 & 0xFF,
-					Size::Word => self.fetch_word() as u32,
-					Size::Long => self.fetch_long(),
-				};
-				let dst = self.decode_ea(ea_mode, ea_reg, size);
-				Instruction {
-					operation: Operation::Cmpi,
-					size: Some(size),
-					src: Some(Operand::Immediate(immediate)),
-					dst: Some(dst),
-				}
-			}
-			0x0188..=0x07C8 if (opcode & 0xF138) == 0x0108 => { // MOVEP
-				let direction = (opcode >> 7) & 0x1; // 0: memory to reg, 1: reg to memory
-				let size = if (opcode >> 6) & 0x1 == 0 { Size::Word } else { Size::Long };
-				let dreg = ((opcode >> 9) & 0x7) as u8;
-				let areg = (opcode & 0x7) as u8;
-				let displacement = self.fetch_word() as i16;
-				let (src, dst) = if direction == 0 {
-					let ea = self.decode_ea(5, areg, size); // Displacement mode
-					(ea, Operand::DataRegister(dreg))
-				} else {
-					let ea = self.decode_ea(5, areg, size); // Displacement mode
-					(Operand::DataRegister(dreg), ea)
-				};
-				Instruction {
-					operation: Operation::Movep,
-					size: Some(size),
-					src: Some(src),
-					dst: Some(dst),
-				}
-			}
-			0x0880..=0x08FF => { // BCLR #<data>,<ea>
-				let bit_number = self.fetch_word() as u8;
-				let ea_mode = ((opcode >> 3) & 0x7) as u8;
-				let ea_reg = (opcode & 0x7) as u8;
-				let size = if ea_mode == 0 { Size::Long } else { Size::Byte }; // Long for Dn, Byte for memory
-				let dst = self.decode_ea(ea_mode, ea_reg, size);
-				Instruction {
-					operation: Operation::Bclr,
-					size: Some(size),
-					src: Some(Operand::Immediate(bit_number as u32)),
-					dst: Some(dst),
-				}
-			}
-			0x41C0..=0x4FFF if (opcode & 0xF1C0) == 0x41C0 => { // LEA <ea>,An
-				let areg = ((opcode >> 9) & 0x7) as u8;
-				let ea_mode = ((opcode >> 3) & 0x7) as u8;
-				let ea_reg = (opcode & 0x7) as u8;
-				let src = self.decode_ea(ea_mode, ea_reg, Size::Long);
-				Instruction {
-					operation: Operation::Lea,
-					size: Some(Size::Long),
-					src: Some(src),
-					dst: Some(Operand::AddressRegister(areg)),
-				}
-			}
-			0x4880..=0x48C0 if (opcode & 0xFF38) == 0x4800 => { // EXT.<size> Dn
-				let size = if (opcode & 0x0040) == 0 { Size::Word } else { Size::Long };
-				let reg = (opcode & 0x7) as u8;
-				Instruction {
-					operation: Operation::Ext,
-					size: Some(size),
-					src: None,
-					dst: Some(Operand::DataRegister(reg)),
-				}
-			}
-			// SUB.<size> <ea>,Dn or Dn,<ea>
-			0x9000..=0x9FFF => {
+			},
+			0x9000..=0x9FFF => { // SUB.<size> <ea>,Dn or Dn,<ea>
 				let reg = ((opcode >> 9) & 0x7) as u8;
 				let direction = (opcode >> 8) & 0x1;
 				let size = match (opcode >> 6) & 0x3 {
@@ -967,186 +1381,8 @@ impl CPU {
 					src: Some(src),
 					dst: Some(dst),
 				}
-			}
-			// ANDI.<size> #<data>,<ea>
-			0x0200..=0x02FC => {
-				let size = match (opcode >> 6) & 0x3 {
-					0 => Size::Byte,
-					1 => Size::Word,
-					2 => Size::Long,
-					_ => unreachable!(),
-				};
-				let ea_mode = ((opcode >> 3) & 0x7) as u8;
-				let ea_reg = (opcode & 0x7) as u8;
-				let immediate = match size {
-					Size::Byte => self.fetch_word() as u32 & 0xFF,
-					Size::Word => self.fetch_word() as u32,
-					Size::Long => self.fetch_long(),
-				};
-				let dst = self.decode_ea(ea_mode, ea_reg, size);
-				Instruction {
-					operation: Operation::Andi,
-					size: Some(size),
-					src: Some(Operand::Immediate(immediate)),
-					dst: Some(dst),
-				}
-			}
-			// ORI.<size> #<data>,<ea>
-			0x0000..=0x00FC => {
-				let size = match (opcode >> 6) & 0x3 {
-					0 => Size::Byte,
-					1 => Size::Word,
-					2 => Size::Long,
-					_ => unreachable!(),
-				};
-				let ea_mode = ((opcode >> 3) & 0x7) as u8;
-				let ea_reg = (opcode & 0x7) as u8;
-				let immediate = match size {
-					Size::Byte => self.fetch_word() as u32 & 0xFF,
-					Size::Word => self.fetch_word() as u32,
-					Size::Long => self.fetch_long(),
-				};
-				let dst = self.decode_ea(ea_mode, ea_reg, size);
-				Instruction {
-					operation: Operation::Ori,
-					size: Some(size),
-					src: Some(Operand::Immediate(immediate)),
-					dst: Some(dst),
-				}
-			}
-			// ADDX.<size> Dy,Dx
-			0xD100..=0xD1F8 if (opcode & 0xF1F8) == 0xD100 => {
-				let size = match (opcode >> 6) & 0x3 {
-					0 => Size::Byte,
-					1 => Size::Word,
-					2 => Size::Long,
-					_ => unreachable!(),
-				};
-				let dx = ((opcode >> 9) & 0x7) as u8;
-				let dy = (opcode & 0x7) as u8;
-				Instruction {
-					operation: Operation::Addx,
-					size: Some(size),
-					src: Some(Operand::DataRegister(dy)),
-					dst: Some(Operand::DataRegister(dx)),
-				}
-			}
-			// SUBX.<size> Dy,Dx
-			0x9100..=0x91F8 if (opcode & 0xF1F8) == 0x9100 => {
-				let size = match (opcode >> 6) & 0x3 {
-					0 => Size::Byte,
-					1 => Size::Word,
-					2 => Size::Long,
-					_ => unreachable!(),
-				};
-				let dx = ((opcode >> 9) & 0x7) as u8;
-				let dy = (opcode & 0x7) as u8;
-				Instruction {
-					operation: Operation::Subx,
-					size: Some(size),
-					src: Some(Operand::DataRegister(dy)),
-					dst: Some(Operand::DataRegister(dx)),
-				}
-			}
-			// BRA.<size> <displacement>
-			0x6000..=0x60FF => {
-				let disp = if (opcode & 0x00FF) == 0 {
-					self.fetch_word() as i16 as i32
-				} else {
-					(opcode & 0x00FF) as i8 as i32
-				};
-				Instruction {
-					operation: Operation::Bra,
-					size: None,
-					src: Some(Operand::Immediate(disp as u32)),
-					dst: None,
-				}
-			}
-			// BEQ.<size> <displacement>
-			0x6700..=0x67FF => {
-				let disp = if (opcode & 0x00FF) == 0 {
-					self.fetch_word() as i16 as i32
-				} else {
-					(opcode & 0x00FF) as i8 as i32
-				};
-				Instruction {
-					operation: Operation::Beq,
-					size: None,
-					src: Some(Operand::Immediate(disp as u32)),
-					dst: None,
-				}
-			}
-			// BNE.<size> <displacement>
-			0x6600..=0x66FF => {
-				let disp = if (opcode & 0x00FF) == 0 {
-					self.fetch_word() as i16 as i32
-				} else {
-					(opcode & 0x00FF) as i8 as i32
-				};
-				Instruction {
-					operation: Operation::Bne,
-					size: None,
-					src: Some(Operand::Immediate(disp as u32)),
-					dst: None,
-				}
-			}
-			// CLR.<size> <ea>
-			0x4200..=0x42FC => {
-				let size = match (opcode >> 6) & 0x3 {
-					0 => Size::Byte,
-					1 => Size::Word,
-					2 => Size::Long,
-					_ => unreachable!(),
-				};
-				let ea_mode = ((opcode >> 3) & 0x7) as u8;
-				let ea_reg = (opcode & 0x7) as u8;
-				let dst = self.decode_ea(ea_mode, ea_reg, size);
-				Instruction {
-					operation: Operation::Clr,
-					size: Some(size),
-					src: None,
-					dst: Some(dst),
-				}
-			}
-			// SWAP Dn
-			0x4840..=0x4847 => {
-				let reg = (opcode & 0x7) as u8;
-				Instruction {
-					operation: Operation::Swap,
-					size: None,
-					src: None,
-					dst: Some(Operand::DataRegister(reg)),
-				}
-			}
-			// CMPA.<size> <ea>,An
-			0xB0C0..=0xBFC0 if (opcode & 0xF1C0) == 0xB0C0 => {
-				let an = ((opcode >> 9) & 0x7) as u8;
-				let size = if (opcode & 0x0100) != 0 { Size::Long } else { Size::Word };
-				let mode = ((opcode >> 3) & 0x7) as u8;
-				let reg = (opcode & 0x7) as u8;
-				let src = self.decode_ea(mode, reg, size);
-				Instruction {
-					operation: Operation::Cmpa,
-					size: Some(size),
-					src: Some(src),
-					dst: Some(Operand::AddressRegister(an)),
-				}
-			}
-			// CHK <ea>,Dn
-			0x4180..=0x41BC => {
-				let dn = ((opcode >> 9) & 0x7) as u8;
-				let mode = ((opcode >> 3) & 0x7) as u8;
-				let reg = (opcode & 0x7) as u8;
-				let src = self.decode_ea(mode, reg, Size::Word);
-				Instruction {
-					operation: Operation::Chk,
-					size: Some(Size::Word),
-					src: Some(src),
-					dst: Some(Operand::DataRegister(dn)),
-				}
-			}
-			// TAS <ea>
-			0x4AC0..=0x4AFC => {
+			},
+			0x4AC0..=0x4AFC => { // TAS <ea>
 				let mode = ((opcode >> 3) & 0x7) as u8;
 				let reg = (opcode & 0x7) as u8;
 				let dst = self.decode_ea(mode, reg, Size::Byte);
@@ -1156,9 +1392,25 @@ impl CPU {
 					src: None,
 					dst: Some(dst),
 				}
-			}
-			// ROL.<size> Dx,Dy or #<data>,Dy
-			0xE118..=0xE17F => {
+			},
+			0x4A00..=0x4AFF => { // TST.B, TST.W, TST.L <ea>
+				let size = match (opcode >> 6) & 0x3 {
+					0 => Size::Byte,
+					1 => Size::Word,
+					2 => Size::Long,
+					_ => unreachable!(),
+				};
+				let src_mode = ((opcode >> 3) & 0x7) as u8;
+				let src_reg = (opcode & 0x7) as u8;
+				let src = self.decode_ea(src_mode, src_reg, size);
+				Instruction {
+					operation: Operation::Tst,
+					size: Some(size),
+					src: Some(src),
+					dst: None,
+				}
+			},
+			0xE118..=0xE17F => { // ROL.<size> Dx,Dy or #<data>,Dy
 				let size = match (opcode >> 6) & 0x3 {
 					0 => Size::Byte,
 					1 => Size::Word,
@@ -1179,9 +1431,8 @@ impl CPU {
 					src: Some(src),
 					dst: Some(Operand::DataRegister(dst_reg)),
 				}
-			}
-			// ROXL.<size> Dx,Dy or #<data>,Dy
-			0xE510..=0xE57F => {
+			},
+			0xE100..=0xE1FF => { // ASL.<size> Dx,Dy or #<data>,Dy
 				let size = match (opcode >> 6) & 0x3 {
 					0 => Size::Byte,
 					1 => Size::Word,
@@ -1197,136 +1448,13 @@ impl CPU {
 					Operand::DataRegister(count_reg)
 				};
 				Instruction {
-					operation: Operation::Roxl,
+					operation: Operation::Asl,
 					size: Some(size),
 					src: Some(src),
 					dst: Some(Operand::DataRegister(dst_reg)),
 				}
-			}
-			// JSR <ea>
-			0x4E80..=0x4EBC => {
-				let mode = ((opcode >> 3) & 0x7) as u8;
-				let reg = (opcode & 0x7) as u8;
-				let src = self.decode_ea(mode, reg, Size::Long);
-				Instruction {
-					operation: Operation::Jsr,
-					size: None,
-					src: Some(src),
-					dst: None,
-				}
-			}
-			// BCHG Dn,<ea>
-			0x0140..=0x017F => {
-				let size = if (opcode & 0x0038) == 0 { Size::Long } else { Size::Byte };
-				let dn = ((opcode >> 9) & 0x7) as u8;
-				let mode = ((opcode >> 3) & 0x7) as u8;
-				let reg = (opcode & 0x7) as u8;
-				let dst = self.decode_ea(mode, reg, size);
-				Instruction {
-					operation: Operation::Bchg,
-					size: Some(size),
-					src: Some(Operand::DataRegister(dn)),
-					dst: Some(dst),
-				}
-			}
-			// BSET Dn,<ea>
-			0x01C0..=0x01FF => {
-				let size = if (opcode & 0x0038) == 0 { Size::Long } else { Size::Byte };
-				let dn = ((opcode >> 9) & 0x7) as u8;
-				let mode = ((opcode >> 3) & 0x7) as u8;
-				let reg = (opcode & 0x7) as u8;
-				let dst = self.decode_ea(mode, reg, size);
-				Instruction {
-					operation: Operation::Bset,
-					size: Some(size),
-					src: Some(Operand::DataRegister(dn)),
-					dst: Some(dst),
-				}
-			}
-			// BTST Dn,<ea>
-			0x0100..=0x013F => {
-				let size = if (opcode & 0x0038) == 0 { Size::Long } else { Size::Byte };
-				let dn = ((opcode >> 9) & 0x7) as u8;
-				let mode = ((opcode >> 3) & 0x7) as u8;
-				let reg = (opcode & 0x7) as u8;
-				let dst = self.decode_ea(mode, reg, size);
-				Instruction {
-					operation: Operation::Btst,
-					size: Some(size),
-					src: Some(Operand::DataRegister(dn)),
-					dst: Some(dst),
-				}
-			}
-			// TRAP #vector
-			0x4E40..=0x4E4F => {
-				let vector = (opcode & 0xF) as u32;
-				Instruction {
-					operation: Operation::Trap,
-					size: None,
-					src: Some(Operand::Immediate(vector)),
-					dst: None,
-				}
-			}
-			// AND.<size> <ea>,Dn
-			0xC000..=0xC1F0 => {
-				let dn = ((opcode >> 9) & 0x7) as u8;
-				let size = match (opcode >> 6) & 0x3 {
-					0 => Size::Byte,
-					1 => Size::Word,
-					2 => Size::Long,
-					_ => unreachable!(),
-				};
-				let mode = ((opcode >> 3) & 0x7) as u8;
-				let reg = (opcode & 0x7) as u8;
-				let src = self.decode_ea(mode, reg, size);
-				Instruction {
-					operation: Operation::And,
-					size: Some(size),
-					src: Some(src),
-					dst: Some(Operand::DataRegister(dn)),
-				}
-			}
-			// OR.<size> <ea>,Dn
-			0x8000..=0x81F0 => {
-				let dn = ((opcode >> 9) & 0x7) as u8;
-				let size = match (opcode >> 6) & 0x3 {
-					0 => Size::Byte,
-					1 => Size::Word,
-					2 => Size::Long,
-					_ => unreachable!(),
-				};
-				let mode = ((opcode >> 3) & 0x7) as u8;
-				let reg = (opcode & 0x7) as u8;
-				let src = self.decode_ea(mode, reg, size);
-				Instruction {
-					operation: Operation::Or,
-					size: Some(size),
-					src: Some(src),
-					dst: Some(Operand::DataRegister(dn)),
-				}
-			}
-			// ADDQ.<size> #<data>,<ea>
-			0x5000..=0x51FC => {
-				let size = match (opcode >> 6) & 0x3 {
-					0 => Size::Byte,
-					1 => Size::Word,
-					2 => Size::Long,
-					_ => unreachable!(),
-				};
-				let data = ((opcode >> 9) & 0x7) as u8;
-				let data = if data == 0 { 8 } else { data }; // 0 means 8
-				let mode = ((opcode >> 3) & 0x7) as u8;
-				let reg = (opcode & 0x7) as u8;
-				let dst = self.decode_ea(mode, reg, size);
-				Instruction {
-					operation: Operation::Addq,
-					size: Some(size),
-					src: Some(Operand::Immediate(data as u32)),
-					dst: Some(dst),
-				}
-			}
-			// SUBQ.<size> #<data>,<ea>
-			0x5100..=0x51FC => {
+			},
+			0x5100..=0x51FC => { // SUBQ.<size> #<data>,<ea>
 				let size = match (opcode >> 6) & 0x3 {
 					0 => Size::Byte,
 					1 => Size::Word,
@@ -1344,103 +1472,27 @@ impl CPU {
 					src: Some(Operand::Immediate(data as u32)),
 					dst: Some(dst),
 				}
-			}
-			// NOT.<size> <ea>
-			0x4600..=0x46FC => {
+			},
+			0x5000..=0x51FC => { // ADDQ.<size> #<data>,<ea>
 				let size = match (opcode >> 6) & 0x3 {
 					0 => Size::Byte,
 					1 => Size::Word,
 					2 => Size::Long,
 					_ => unreachable!(),
 				};
+				let data = ((opcode >> 9) & 0x7) as u8;
+				let data = if data == 0 { 8 } else { data }; // 0 means 8
 				let mode = ((opcode >> 3) & 0x7) as u8;
 				let reg = (opcode & 0x7) as u8;
 				let dst = self.decode_ea(mode, reg, size);
 				Instruction {
-					operation: Operation::Not,
+					operation: Operation::Addq,
 					size: Some(size),
-					src: None,
+					src: Some(Operand::Immediate(data as u32)),
 					dst: Some(dst),
 				}
-			}
-			// DIVS.W <ea>,Dn
-			0x81C0..=0x81FF => {
-				let dn = ((opcode >> 9) & 0x7) as u8;
-				let mode = ((opcode >> 3) & 0x7) as u8;
-				let reg = (opcode & 0x7) as u8;
-				let src = self.decode_ea(mode, reg, Size::Word);
-				Instruction {
-					operation: Operation::Divs,
-					size: Some(Size::Word),
-					src: Some(src),
-					dst: Some(Operand::DataRegister(dn)),
-				}
-			}
-			// ROXR.<size> Dx,Dy or #<data>,Dy
-			0xE410..=0xE47F => {
-				let size = match (opcode >> 6) & 0x3 {
-					0 => Size::Byte,
-					1 => Size::Word,
-					2 => Size::Long,
-					_ => unreachable!(),
-				};
-				let count_reg = ((opcode >> 9) & 0x7) as u8;
-				let dr = (opcode >> 5) & 0x1; // 0: immediate, 1: register
-				let dst_reg = (opcode & 0x7) as u8;
-				let src = if dr == 0 {
-					Operand::Immediate(if count_reg == 0 { 8 } else { count_reg as u32 })
-				} else {
-					Operand::DataRegister(count_reg)
-				};
-				Instruction {
-					operation: Operation::Roxr,
-					size: Some(size),
-					src: Some(src),
-					dst: Some(Operand::DataRegister(dst_reg)),
-				}
-			}
-			// BHI <displacement>
-			0x6200..=0x62FF => {
-				let disp = if (opcode & 0x00FF) == 0 {
-					self.fetch_word() as i16 as i32
-				} else {
-					(opcode & 0x00FF) as i8 as i32
-				};
-				Instruction {
-					operation: Operation::Bhi,
-					size: None,
-					src: Some(Operand::Immediate(disp as u32)),
-					dst: None,
-				}
-			}
-			// BLS <displacement>
-			0x6300..=0x63FF => {
-				let disp = if (opcode & 0x00FF) == 0 {
-					self.fetch_word() as i16 as i32
-				} else {
-					(opcode & 0x00FF) as i8 as i32
-				};
-				Instruction {
-					operation: Operation::Bls,
-					size: None,
-					src: Some(Operand::Immediate(disp as u32)),
-					dst: None,
-				}
-			}
-			// JMP <ea>
-			0x4EC0..=0x4EFC => {
-				let mode = ((opcode >> 3) & 0x7) as u8;
-				let reg = (opcode & 0x7) as u8;
-				let src = self.decode_ea(mode, reg, Size::Long);
-				Instruction {
-					operation: Operation::Jmp,
-					size: None,
-					src: Some(src),
-					dst: None,
-				}
-			}
-			// ADDA.<size> <ea>,An
-			0xD0C0..=0xDFFC if (opcode & 0xF1C0) == 0xD0C0 => {
+			},
+			0xD0C0..=0xDFFC if (opcode & 0xF1C0) == 0xD0C0 => { // ADDA.<size> <ea>,An
 				let an = ((opcode >> 9) & 0x7) as u8;
 				let size = if (opcode & 0x0100) != 0 { Size::Long } else { Size::Word };
 				let mode = ((opcode >> 3) & 0x7) as u8;
@@ -1452,9 +1504,8 @@ impl CPU {
 					src: Some(src),
 					dst: Some(Operand::AddressRegister(an)),
 				}
-			}
-			// SUBA.<size> <ea>,An
-			0x90C0..=0x9FFC if (opcode & 0xF1C0) == 0x90C0 => {
+			},
+			0x90C0..=0x9FFC if (opcode & 0xF1C0) == 0x90C0 => { // SUBA.<size> <ea>,An
 				let an = ((opcode >> 9) & 0x7) as u8;
 				let size = if (opcode & 0x0100) != 0 { Size::Long } else { Size::Word };
 				let mode = ((opcode >> 3) & 0x7) as u8;
@@ -1466,9 +1517,8 @@ impl CPU {
 					src: Some(src),
 					dst: Some(Operand::AddressRegister(an)),
 				}
-			}
-			// MULU.W <ea>,Dn
-			0xC0C0..=0xC0FF => {
+			},
+			0xC0C0..=0xC0FF => { // MULU.W <ea>,Dn
 				let dn = ((opcode >> 9) & 0x7) as u8;
 				let mode = ((opcode >> 3) & 0x7) as u8;
 				let reg = (opcode & 0x7) as u8;
@@ -1479,9 +1529,8 @@ impl CPU {
 					src: Some(src),
 					dst: Some(Operand::DataRegister(dn)),
 				}
-			}
-			// CMP.<size> <ea>,Dn
-			0xB000..=0xB1F0 => {
+			},
+			0xC000..=0xC1F0 => { // AND.<size> <ea>,Dn
 				let dn = ((opcode >> 9) & 0x7) as u8;
 				let size = match (opcode >> 6) & 0x3 {
 					0 => Size::Byte,
@@ -1493,14 +1542,23 @@ impl CPU {
 				let reg = (opcode & 0x7) as u8;
 				let src = self.decode_ea(mode, reg, size);
 				Instruction {
-					operation: Operation::Cmp,
+					operation: Operation::And,
 					size: Some(size),
 					src: Some(src),
 					dst: Some(Operand::DataRegister(dn)),
 				}
-			}
-			// Scc <ea> (e.g., SHS for Carry Clear)
-			0x54C0..=0x54FC => {
+			},
+			0x54C8..=0x54CF => { // DBcc Dn,<displacement> (e.g., DBEQ)
+				let dn = (opcode & 0x7) as u8;
+				let disp = self.fetch_word() as i16 as i32;
+				Instruction {
+					operation: Operation::Dbcc,
+					size: Some(Size::Word),
+					src: Some(Operand::DataRegister(dn)),
+					dst: Some(Operand::Immediate(disp as u32)),
+				}
+			},
+			0x54C0..=0x54FC => { // Scc <ea> (e.g., SHS for Carry Clear)
 				let mode = ((opcode >> 3) & 0x7) as u8;
 				let reg = (opcode & 0x7) as u8;
 				let dst = self.decode_ea(mode, reg, Size::Byte);
@@ -1510,90 +1568,8 @@ impl CPU {
 					src: None,
 					dst: Some(dst),
 				}
-			}
-			// DBcc Dn,<displacement> (e.g., DBEQ)
-			0x54C8..=0x54CF => {
-				let dn = (opcode & 0x7) as u8;
-				let disp = self.fetch_word() as i16 as i32;
-				Instruction {
-					operation: Operation::Dbcc,
-					size: Some(Size::Word),
-					src: Some(Operand::DataRegister(dn)),
-					dst: Some(Operand::Immediate(disp as u32)),
-				}
-			}
-			// PEA <ea>
-			0x4840..=0x487C if (opcode & 0xF1C0) == 0x4840 => {
-				let mode = ((opcode >> 3) & 0x7) as u8;
-				let reg = (opcode & 0x7) as u8;
-				let src = self.decode_ea(mode, reg, Size::Long);
-				Instruction {
-					operation: Operation::Pea,
-					size: None,
-					src: Some(src),
-					dst: None,
-				}
-			}
-			// LINK An,#<displacement>
-			0x4E50..=0x4E57 => {
-				let an = (opcode & 0x7) as u8;
-				let disp = self.fetch_word() as i16 as i32;
-				Instruction {
-					operation: Operation::Link,
-					size: None,
-					src: Some(Operand::Immediate(disp as u32)),
-					dst: Some(Operand::AddressRegister(an)),
-				}
-			}
-			// UNLK An
-			0x4E58..=0x4E5F => {
-				let an = (opcode & 0x7) as u8;
-				Instruction {
-					operation: Operation::Unlk,
-					size: None,
-					src: None,
-					dst: Some(Operand::AddressRegister(an)),
-				}
-			}
-			// NOP (alternative form, e.g., 0x4E72 as a placeholder for distinction)
-			0x4E72 => {
-				Instruction {
-					operation: Operation::NopAlt,
-					size: None,
-					src: None,
-					dst: None,
-				}
-			}
-			// BGT <displacement>
-			0x6E00..=0x6EFF => {
-				let disp = if (opcode & 0x00FF) == 0 {
-					self.fetch_word() as i16 as i32
-				} else {
-					(opcode & 0x00FF) as i8 as i32
-				};
-				Instruction {
-					operation: Operation::Bgt,
-					size: None,
-					src: Some(Operand::Immediate(disp as u32)),
-					dst: None,
-				}
-			}
-			// BLE <displacement>
-			0x6F00..=0x6FFF => {
-				let disp = if (opcode & 0x00FF) == 0 {
-					self.fetch_word() as i16 as i32
-				} else {
-					(opcode & 0x00FF) as i8 as i32
-				};
-				Instruction {
-					operation: Operation::Ble,
-					size: None,
-					src: Some(Operand::Immediate(disp as u32)),
-					dst: None,
-				}
-			}
-			// EXG Dx,Dy
-			0xC140..=0xC148 => {
+			},
+			0xC140..=0xC148 => { // EXG Dx,Dy
 				let dx = ((opcode >> 9) & 0x7) as u8;
 				let dy = (opcode & 0x7) as u8;
 				Instruction {
@@ -1602,29 +1578,8 @@ impl CPU {
 					src: Some(Operand::DataRegister(dx)),
 					dst: Some(Operand::DataRegister(dy)),
 				}
-			}
-			// MOVEM.<size> <ea>,reglist or reglist,<ea>
-			0x4880..=0x4BFC if (opcode & 0xFB80) == 0x4880 => {
-				let direction = (opcode >> 10) & 0x1; // 0: reg to mem, 1: mem to reg
-				let size = if (opcode & 0x0040) != 0 { Size::Long } else { Size::Word };
-				let mode = ((opcode >> 3) & 0x7) as u8;
-				let reg = (opcode & 0x7) as u8;
-				let reglist = self.fetch_word();
-				let ea = self.decode_ea(mode, reg, size);
-				let (src, dst) = if direction == 0 {
-					(Operand::Immediate(reglist as u32), ea)
-				} else {
-					(ea, Operand::Immediate(reglist as u32))
-				};
-				Instruction {
-					operation: Operation::Movem,
-					size: Some(size),
-					src: Some(src),
-					dst: Some(dst),
-				}
-			}
-			// ASL.<size> <ea>
-			0xE100..=0xE1F8 if (opcode & 0xF138) == 0xE100 => {
+			},
+			0xE100..=0xE1F8 if (opcode & 0xF138) == 0xE100 => { // ASL.<size> <ea>
 				let size = match (opcode >> 6) & 0x3 {
 					0 => Size::Byte,
 					1 => Size::Word,
@@ -1640,27 +1595,8 @@ impl CPU {
 					src: Some(Operand::Immediate(1)), // Shift by 1
 					dst: Some(dst),
 				}
-			}
-			// LSR.<size> <ea>
-			0xE008..=0xE0F8 if (opcode & 0xF138) == 0xE008 => {
-				let size = match (opcode >> 6) & 0x3 {
-					0 => Size::Byte,
-					1 => Size::Word,
-					2 => Size::Long,
-					_ => unreachable!(),
-				};
-				let mode = ((opcode >> 3) & 0x7) as u8;
-				let reg = (opcode & 0x7) as u8;
-				let dst = self.decode_ea(mode, reg, size);
-				Instruction {
-					operation: Operation::LsrMem,
-					size: Some(size),
-					src: Some(Operand::Immediate(1)), // Shift by 1
-					dst: Some(dst),
-				}
-			}
-			// CLR.<size> <ea> (alternative form, distinct range for demonstration)
-			0x4200..=0x42F8 if (opcode & 0xFF00) == 0x4200 => {
+			},
+			0x4200..=0x42F8 if (opcode & 0xFF00) == 0x4200 => { // CLR.<size> <ea> (alternative form)
 				let size = match (opcode >> 6) & 0x3 {
 					0 => Size::Byte,
 					1 => Size::Word,
@@ -1676,125 +1612,25 @@ impl CPU {
 					src: None,
 					dst: Some(dst),
 				}
-			}
-			// STOP #<data>
-			0x4E72 => {
-				let data = self.fetch_word() as u32;
+			},
+			0x4200..=0x42FC => { // CLR.<size> <ea>
+				let size = match (opcode >> 6) & 0x3 {
+					0 => Size::Byte,
+					1 => Size::Word,
+					2 => Size::Long,
+					_ => unreachable!(),
+				};
+				let ea_mode = ((opcode >> 3) & 0x7) as u8;
+				let ea_reg = (opcode & 0x7) as u8;
+				let dst = self.decode_ea(ea_mode, ea_reg, size);
 				Instruction {
-					operation: Operation::Stop,
-					size: None,
-					src: Some(Operand::Immediate(data)),
-					dst: None,
-				}
-			}
-			// RTD #<displacement>
-			0x4E74 => {
-				let disp = self.fetch_word() as i16 as i32;
-				Instruction {
-					operation: Operation::Rtd,
-					size: None,
-					src: Some(Operand::Immediate(disp as u32)),
-					dst: None,
-				}
-			}
-			// TAS <ea> (alternative form, distinct range for demonstration)
-			0x4AFC => {
-				let mode = ((opcode >> 3) & 0x7) as u8;
-				let reg = (opcode & 0x7) as u8;
-				let dst = self.decode_ea(mode, reg, Size::Byte);
-				Instruction {
-					operation: Operation::TasMem,
-					size: Some(Size::Byte),
+					operation: Operation::Clr,
+					size: Some(size),
 					src: None,
 					dst: Some(dst),
 				}
-			}
-			// BCC <displacement>
-			0x6400..=0x64FF => {
-				let disp = if (opcode & 0x00FF) == 0 {
-					self.fetch_word() as i16 as i32
-				} else {
-					(opcode & 0x00FF) as i8 as i32
-				};
-				Instruction {
-					operation: Operation::Bcc,
-					size: None,
-					src: Some(Operand::Immediate(disp as u32)),
-					dst: None,
-				}
-			}
-			// BCS <displacement>
-			0x6500..=0x65FF => {
-				let disp = if (opcode & 0x00FF) == 0 {
-					self.fetch_word() as i16 as i32
-				} else {
-					(opcode & 0x00FF) as i8 as i32
-				};
-				Instruction {
-					operation: Operation::Bcs,
-					size: None,
-					src: Some(Operand::Immediate(disp as u32)),
-					dst: None,
-				}
-			}
-			// BGE <displacement>
-			0x6C00..=0x6CFF => {
-				let disp = if (opcode & 0x00FF) == 0 {
-					self.fetch_word() as i16 as i32
-				} else {
-					(opcode & 0x00FF) as i8 as i32
-				};
-				Instruction {
-					operation: Operation::Bge,
-					size: None,
-					src: Some(Operand::Immediate(disp as u32)),
-					dst: None,
-				}
-			}
-			// BLT <displacement>
-			0x6D00..=0x6DFF => {
-				let disp = if (opcode & 0x00FF) == 0 {
-					self.fetch_word() as i16 as i32
-				} else {
-					(opcode & 0x00FF) as i8 as i32
-				};
-				Instruction {
-					operation: Operation::Blt,
-					size: None,
-					src: Some(Operand::Immediate(disp as u32)),
-					dst: None,
-				}
-			}
-			// BMI <displacement>
-			0x6B00..=0x6BFF => {
-				let disp = if (opcode & 0x00FF) == 0 {
-					self.fetch_word() as i16 as i32
-				} else {
-					(opcode & 0x00FF) as i8 as i32
-				};
-				Instruction {
-					operation: Operation::Bmi,
-					size: None,
-					src: Some(Operand::Immediate(disp as u32)),
-					dst: None,
-				}
-			}
-			// BPL <displacement>
-			0x6A00..=0x6AFF => {
-				let disp = if (opcode & 0x00FF) == 0 {
-					self.fetch_word() as i16 as i32
-				} else {
-					(opcode & 0x00FF) as i8 as i32
-				};
-				Instruction {
-					operation: Operation::Bpl,
-					size: None,
-					src: Some(Operand::Immediate(disp as u32)),
-					dst: None,
-				}
-			}
-			// LSL.<size> Dx,Dy or #<data>,Dy
-			0xE108..=0xE17F if (opcode & 0xFEE0) == 0xE108 => {
+			},
+			0xE108..=0xE17F if (opcode & 0xFEE0) == 0xE108 => { // LSL.<size> Dx,Dy or #<data>,Dy
 				let size = match (opcode >> 6) & 0x3 {
 					0 => Size::Byte,
 					1 => Size::Word,
@@ -1815,68 +1651,8 @@ impl CPU {
 					src: Some(src),
 					dst: Some(Operand::DataRegister(dst_reg)),
 				}
-			}
-			// ROL.<size> <ea>
-			0xE7C0..=0xE7F8 if (opcode & 0xF1C0) == 0xE7C0 => {
-				let size = match (opcode >> 6) & 0x3 {
-					0 => Size::Byte,
-					1 => Size::Word,
-					2 => Size::Long,
-					_ => unreachable!(),
-				};
-				let mode = ((opcode >> 3) & 0x7) as u8;
-				let reg = (opcode & 0x7) as u8;
-				let dst = self.decode_ea(mode, reg, size);
-				Instruction {
-					operation: Operation::RolMem,
-					size: Some(size),
-					src: Some(Operand::Immediate(1)), // Rotate by 1
-					dst: Some(dst),
-				}
-			}
-			// ROR.<size> <ea>
-			0xE6C0..=0xE6F8 if (opcode & 0xF1C0) == 0xE6C0 => {
-				let size = match (opcode >> 6) & 0x3 {
-					0 => Size::Byte,
-					1 => Size::Word,
-					2 => Size::Long,
-					_ => unreachable!(),
-				};
-				let mode = ((opcode >> 3) & 0x7) as u8;
-				let reg = (opcode & 0x7) as u8;
-				let dst = self.decode_ea(mode, reg, size);
-				Instruction {
-					operation: Operation::RorMem,
-					size: Some(size),
-					src: Some(Operand::Immediate(1)), // Rotate by 1
-					dst: Some(dst),
-				}
-			}
-			// SUBI.<size> #<data>,<ea>
-			0x0400..=0x04FC => {
-				let size = match (opcode >> 6) & 0x3 {
-					0 => Size::Byte,
-					1 => Size::Word,
-					2 => Size::Long,
-					_ => unreachable!(),
-				};
-				let ea_mode = ((opcode >> 3) & 0x7) as u8;
-				let ea_reg = (opcode & 0x7) as u8;
-				let immediate = match size {
-					Size::Byte => self.fetch_word() as u32 & 0xFF,
-					Size::Word => self.fetch_word() as u32,
-					Size::Long => self.fetch_long(),
-				};
-				let dst = self.decode_ea(ea_mode, ea_reg, size);
-				Instruction {
-					operation: Operation::Subi,
-					size: Some(size),
-					src: Some(Operand::Immediate(immediate)),
-					dst: Some(dst),
-				}
-			}
-			// ABCD Dy,Dx or -(Ay),-(Ax)
-			0xC100..=0xC1F8 if (opcode & 0xF1F0) == 0xC100 => {
+			},
+			0xC100..=0xC1F8 if (opcode & 0xF1F0) == 0xC100 => { // ABCD Dy,Dx or -(Ay),-(Ax)
 				let dx = ((opcode >> 9) & 0x7) as u8;
 				let dy = (opcode & 0x7) as u8;
 				let rm = (opcode >> 3) & 0x1; // 0: register, 1: memory
@@ -1891,9 +1667,8 @@ impl CPU {
 					src: Some(src),
 					dst: Some(dst),
 				}
-			}
-			// SBCD Dy,Dx or -(Ay),-(Ax)
-			0x8100..=0x81F8 if (opcode & 0xF1F0) == 0x8100 => {
+			},
+			0x8100..=0x81F8 if (opcode & 0xF1F0) == 0x8100 => { // SBCD Dy,Dx or -(Ay),-(Ax)
 				let dx = ((opcode >> 9) & 0x7) as u8;
 				let dy = (opcode & 0x7) as u8;
 				let rm = (opcode >> 3) & 0x1; // 0: register, 1: memory
@@ -1908,21 +1683,41 @@ impl CPU {
 					src: Some(src),
 					dst: Some(dst),
 				}
-			}
-			// NBCD <ea>
-			0x4800..=0x483C => {
+			},
+			0x2040..=0x3FFF if (opcode & 0xF1C0) == 0x2040 => { // MOVEA.<size> <ea>,An
+				let size = if (opcode & 0xC000) == 0x2000 { Size::Word } else { Size::Long };
+				let an = ((opcode >> 9) & 0x7) as u8;
 				let mode = ((opcode >> 3) & 0x7) as u8;
 				let reg = (opcode & 0x7) as u8;
-				let dst = self.decode_ea(mode, reg, Size::Byte);
+				let src = self.decode_ea(mode, reg, size);
 				Instruction {
-					operation: Operation::Nbcd,
-					size: Some(Size::Byte),
-					src: None,
+					operation: Operation::Movea,
+					size: Some(size),
+					src: Some(src),
+					dst: Some(Operand::AddressRegister(an)),
+				}
+			},
+			0x1000..=0x3FFF => { // MOVE.B, MOVE.W, MOVE.L
+				let size = match (opcode >> 12) & 0x3 {
+					1 => Size::Byte,
+					3 => Size::Word,
+					2 => Size::Long,
+					_ => unreachable!(),
+				};
+				let dst_reg = ((opcode >> 9) & 0x7) as u8;
+				let dst_mode = ((opcode >> 6) & 0x7) as u8;
+				let src_mode = ((opcode >> 3) & 0x7) as u8;
+				let src_reg = (opcode & 0x7) as u8;
+				let src = self.decode_ea(src_mode, src_reg, size);
+				let dst = self.decode_ea(dst_mode, dst_reg, size);
+				Instruction {
+					operation: Operation::Move,
+					size: Some(size),
+					src: Some(src),
 					dst: Some(dst),
 				}
-			}
-			// ADDI.<size> #<data>,<ea>
-			0x0600..=0x06FC => {
+			},
+			0x0200..=0x02FC => { // ANDI.<size> #<data>,<ea>
 				let size = match (opcode >> 6) & 0x3 {
 					0 => Size::Byte,
 					1 => Size::Word,
@@ -1938,14 +1733,314 @@ impl CPU {
 				};
 				let dst = self.decode_ea(ea_mode, ea_reg, size);
 				Instruction {
-					operation: Operation::Addi,
+					operation: Operation::Andi,
 					size: Some(size),
 					src: Some(Operand::Immediate(immediate)),
 					dst: Some(dst),
 				}
-			}
-			// BVC <displacement>
-			0x6800..=0x68FF => {
+			},
+			0x0000..=0x00FC => { // ORI.<size> #<data>,<ea>
+				let size = match (opcode >> 6) & 0x3 {
+					0 => Size::Byte,
+					1 => Size::Word,
+					2 => Size::Long,
+					_ => unreachable!(),
+				};
+				let ea_mode = ((opcode >> 3) & 0x7) as u8;
+				let ea_reg = (opcode & 0x7) as u8;
+				let immediate = match size {
+					Size::Byte => self.fetch_word() as u32 & 0xFF,
+					Size::Word => self.fetch_word() as u32,
+					Size::Long => self.fetch_long(),
+				};
+				let dst = self.decode_ea(ea_mode, ea_reg, size);
+				Instruction {
+					operation: Operation::Ori,
+					size: Some(size),
+					src: Some(Operand::Immediate(immediate)),
+					dst: Some(dst),
+				}
+			},
+			0x0A00..=0x0AFC => { // EORI #<data>,<ea>
+				let size = match (opcode >> 6) & 0x3 {
+					0 => Size::Byte,
+					1 => Size::Word,
+					2 => Size::Long,
+					_ => unreachable!(),
+				};
+				let ea_mode = ((opcode >> 3) & 0x7) as u8;
+				let ea_reg = (opcode & 0x7) as u8;
+				let immediate = match size {
+					Size::Byte => self.fetch_word() as u32 & 0xFF,
+					Size::Word => self.fetch_word() as u32,
+					Size::Long => self.fetch_long(),
+				};
+				let dst = self.decode_ea(ea_mode, ea_reg, size);
+				Instruction {
+					operation: Operation::Eori,
+					size: Some(size),
+					src: Some(Operand::Immediate(immediate)),
+					dst: Some(dst),
+				}
+			},
+			0x0C00..=0x0CFC => { // CMPI #<data>,<ea>
+				let size = match (opcode >> 6) & 0x3 {
+					0 => Size::Byte,
+					1 => Size::Word,
+					2 => Size::Long,
+					_ => unreachable!(),
+				};
+				let ea_mode = ((opcode >> 3) & 0x7) as u8;
+				let ea_reg = (opcode & 0x7) as u8;
+				let immediate = match size {
+					Size::Byte => self.fetch_word() as u32 & 0xFF,
+					Size::Word => self.fetch_word() as u32,
+					Size::Long => self.fetch_long(),
+				};
+				let dst = self.decode_ea(ea_mode, ea_reg, size);
+				Instruction {
+					operation: Operation::Cmpi,
+					size: Some(size),
+					src: Some(Operand::Immediate(immediate)),
+					dst: Some(dst),
+				}
+			},
+			0x80C0..=0x80FF => { // DIVU.W <ea>, Dn
+				let reg = ((opcode >> 9) & 0x7) as u8;
+				let src_mode = ((opcode >> 3) & 0x7) as u8;
+				let src_reg = (opcode & 0x7) as u8;
+				let src = self.decode_ea(src_mode, src_reg, Size::Word);
+				Instruction {
+					operation: Operation::Divu,
+					size: Some(Size::Word),
+					src: Some(src),
+					dst: Some(Operand::DataRegister(reg)),
+				}
+			},
+			0xC1C0..=0xC1FF => { // MULS.W <ea>, Dn
+				let reg = ((opcode >> 9) & 0x7) as u8;
+				let src_mode = ((opcode >> 3) & 0x7) as u8;
+				let src_reg = (opcode & 0x7) as u8;
+				let src = self.decode_ea(src_mode, src_reg, Size::Word);
+				Instruction {
+					operation: Operation::Muls,
+					size: Some(Size::Word),
+					src: Some(src),
+					dst: Some(Operand::DataRegister(reg)),
+				}
+			},
+			0xB100..=0xB7FF => { // EOR.B, EOR.W, EOR.L Dn, <ea>
+				let size = match (opcode >> 6) & 0x3 {
+					0 => Size::Byte,
+					1 => Size::Word,
+					2 => Size::Long,
+					_ => unreachable!(),
+				};
+				let reg = ((opcode >> 9) & 0x7) as u8;
+				let dst_mode = ((opcode >> 3) & 0x7) as u8;
+				let dst_reg = (opcode & 0x7) as u8;
+				let dst = self.decode_ea(dst_mode, dst_reg, size);
+				Instruction {
+					operation: Operation::Eor,
+					size: Some(size),
+					src: Some(Operand::DataRegister(reg)),
+					dst: Some(dst),
+				}
+			},
+			0x4400..=0x44FF => { // NEG.B, NEG.W, NEG.L <ea>
+				let size = match (opcode >> 6) & 0x3 {
+					0 => Size::Byte,
+					1 => Size::Word,
+					2 => Size::Long,
+					_ => unreachable!(),
+				};
+				let dst_mode = ((opcode >> 3) & 0x7) as u8;
+				let dst_reg = (opcode & 0x7) as u8;
+				let dst = self.decode_ea(dst_mode, dst_reg, size);
+				Instruction {
+					operation: Operation::Neg,
+					size: Some(size),
+					src: None,
+					dst: Some(dst),
+				}
+			},
+			0x7000..=0x7FFF => { // MOVEQ.L #<data>, Dn
+				let reg = ((opcode >> 9) & 0x7) as u8;
+				let data = (opcode & 0xFF) as i8 as i32 as u32; // Sign-extended to 32 bits
+				Instruction {
+					operation: Operation::Moveq,
+					size: Some(Size::Long),
+					src: Some(Operand::Immediate(data)),
+					dst: Some(Operand::DataRegister(reg)),
+				}
+			},
+			0x4180..=0x41BC => { // CHK <ea>,Dn
+				let dn = ((opcode >> 9) & 0x7) as u8;
+				let mode = ((opcode >> 3) & 0x7) as u8;
+				let reg = (opcode & 0x7) as u8;
+				let src = self.decode_ea(mode, reg, Size::Word);
+				Instruction {
+					operation: Operation::Chk,
+					size: Some(Size::Word),
+					src: Some(src),
+					dst: Some(Operand::DataRegister(dn)),
+				}
+			},
+			0x4840..=0x4847 => { // SWAP Dn
+				let reg = (opcode & 0x7) as u8;
+				Instruction {
+					operation: Operation::Swap,
+					size: None,
+					src: None,
+					dst: Some(Operand::DataRegister(reg)),
+				}
+			},
+
+			// Conditional branches
+			0x6000..=0x60FF => { // BRA.<size> <displacement>
+				let disp = if (opcode & 0x00FF) == 0 {
+					self.fetch_word() as i16 as i32
+				} else {
+					(opcode & 0x00FF) as i8 as i32
+				};
+				Instruction {
+					operation: Operation::Bra,
+					size: None,
+					src: Some(Operand::Immediate(disp as u32)),
+					dst: None,
+				}
+			},
+			0x6700..=0x67FF => { // BEQ.<size> <displacement>
+				let disp = if (opcode & 0x00FF) == 0 {
+					self.fetch_word() as i16 as i32
+				} else {
+					(opcode & 0x00FF) as i8 as i32
+				};
+				Instruction {
+					operation: Operation::Beq,
+					size: None,
+					src: Some(Operand::Immediate(disp as u32)),
+					dst: None,
+				}
+			},
+			0x6600..=0x66FF => { // BNE.<size> <displacement>
+				let disp = if (opcode & 0x00FF) == 0 {
+					self.fetch_word() as i16 as i32
+				} else {
+					(opcode & 0x00FF) as i8 as i32
+				};
+				Instruction {
+					operation: Operation::Bne,
+					size: None,
+					src: Some(Operand::Immediate(disp as u32)),
+					dst: None,
+				}
+			},
+			0x6200..=0x62FF => { // BHI <displacement>
+				let disp = if (opcode & 0x00FF) == 0 {
+					self.fetch_word() as i16 as i32
+				} else {
+					(opcode & 0x00FF) as i8 as i32
+				};
+				Instruction {
+					operation: Operation::Bhi,
+					size: None,
+					src: Some(Operand::Immediate(disp as u32)),
+					dst: None,
+				}
+			},
+			0x6300..=0x63FF => { // BLS <displacement>
+				let disp = if (opcode & 0x00FF) == 0 {
+					self.fetch_word() as i16 as i32
+				} else {
+					(opcode & 0x00FF) as i8 as i32
+				};
+				Instruction {
+					operation: Operation::Bls,
+					size: None,
+					src: Some(Operand::Immediate(disp as u32)),
+					dst: None,
+				}
+			},
+			0x6400..=0x64FF => { // BCC <displacement>
+				let disp = if (opcode & 0x00FF) == 0 {
+					self.fetch_word() as i16 as i32
+				} else {
+					(opcode & 0x00FF) as i8 as i32
+				};
+				Instruction {
+					operation: Operation::Bcc,
+					size: None,
+					src: Some(Operand::Immediate(disp as u32)),
+					dst: None,
+				}
+			},
+			0x6500..=0x65FF => { // BCS <displacement>
+				let disp = if (opcode & 0x00FF) == 0 {
+					self.fetch_word() as i16 as i32
+				} else {
+					(opcode & 0x00FF) as i8 as i32
+				};
+				Instruction {
+					operation: Operation::Bcs,
+					size: None,
+					src: Some(Operand::Immediate(disp as u32)),
+					dst: None,
+				}
+			},
+			0x6C00..=0x6CFF => { // BGE <displacement>
+				let disp = if (opcode & 0x00FF) == 0 {
+					self.fetch_word() as i16 as i32
+				} else {
+					(opcode & 0x00FF) as i8 as i32
+				};
+				Instruction {
+					operation: Operation::Bge,
+					size: None,
+					src: Some(Operand::Immediate(disp as u32)),
+					dst: None,
+				}
+			},
+			0x6D00..=0x6DFF => { // BLT <displacement>
+				let disp = if (opcode & 0x00FF) == 0 {
+					self.fetch_word() as i16 as i32
+				} else {
+					(opcode & 0x00FF) as i8 as i32
+				};
+				Instruction {
+					operation: Operation::Blt,
+					size: None,
+					src: Some(Operand::Immediate(disp as u32)),
+					dst: None,
+				}
+			},
+			0x6B00..=0x6BFF => { // BMI <displacement>
+				let disp = if (opcode & 0x00FF) == 0 {
+					self.fetch_word() as i16 as i32
+				} else {
+					(opcode & 0x00FF) as i8 as i32
+				};
+				Instruction {
+					operation: Operation::Bmi,
+					size: None,
+					src: Some(Operand::Immediate(disp as u32)),
+					dst: None,
+				}
+			},
+			0x6A00..=0x6AFF => { // BPL <displacement>
+				let disp = if (opcode & 0x00FF) == 0 {
+					self.fetch_word() as i16 as i32
+				} else {
+					(opcode & 0x00FF) as i8 as i32
+				};
+				Instruction {
+					operation: Operation::Bpl,
+					size: None,
+					src: Some(Operand::Immediate(disp as u32)),
+					dst: None,
+				}
+			},
+			0x6800..=0x68FF => { // BVC <displacement>
 				let disp = if (opcode & 0x00FF) == 0 {
 					self.fetch_word() as i16 as i32
 				} else {
@@ -1957,9 +2052,8 @@ impl CPU {
 					src: Some(Operand::Immediate(disp as u32)),
 					dst: None,
 				}
-			}
-			// BVS <displacement>
-			0x6900..=0x69FF => {
+			},
+			0x6900..=0x69FF => { // BVS <displacement>
 				let disp = if (opcode & 0x00FF) == 0 {
 					self.fetch_word() as i16 as i32
 				} else {
@@ -1971,196 +2065,44 @@ impl CPU {
 					src: Some(Operand::Immediate(disp as u32)),
 					dst: None,
 				}
-			}
-			// ROXL.<size> <ea>
-			0xE5C0..=0xE5F8 if (opcode & 0xF1C0) == 0xE5C0 => {
-				let size = match (opcode >> 6) & 0x3 {
-					0 => Size::Byte,
-					1 => Size::Word,
-					2 => Size::Long,
-					_ => unreachable!(),
-				};
-				let mode = ((opcode >> 3) & 0x7) as u8;
-				let reg = (opcode & 0x7) as u8;
-				let dst = self.decode_ea(mode, reg, size);
-				Instruction {
-					operation: Operation::RoxlMem,
-					size: Some(size),
-					src: Some(Operand::Immediate(1)), // Rotate by 1
-					dst: Some(dst),
-				}
-			}
-			// ROXR.<size> <ea>
-			0xE4C0..=0xE4F8 if (opcode & 0xF1C0) == 0xE4C0 => {
-				let size = match (opcode >> 6) & 0x3 {
-					0 => Size::Byte,
-					1 => Size::Word,
-					2 => Size::Long,
-					_ => unreachable!(),
-				};
-				let mode = ((opcode >> 3) & 0x7) as u8;
-				let reg = (opcode & 0x7) as u8;
-				let dst = self.decode_ea(mode, reg, size);
-				Instruction {
-					operation: Operation::RoxrMem,
-					size: Some(size),
-					src: Some(Operand::Immediate(1)), // Rotate by 1
-					dst: Some(dst),
-				}
-			}
-			// TRAPV
-			0x4E76 => {
-				Instruction {
-					operation: Operation::Trapv,
-					size: None,
-					src: None,
-					dst: None,
-				}
-			}
-			// RESET
-			0x4E70 => {
-				Instruction {
-					operation: Operation::Reset,
-					size: None,
-					src: None,
-					dst: None,
-				}
-			}
-			// RTE
-			0x4E73 => {
-				Instruction {
-					operation: Operation::Rte,
-					size: None,
-					src: None,
-					dst: None,
-				}
-			}
-			// MOVEA.<size> <ea>,An (subset of MOVE where dst is An)
-			0x2040..=0x3FFF if (opcode & 0xF1C0) == 0x2040 => {
-				let size = if (opcode & 0xC000) == 0x2000 { Size::Word } else { Size::Long };
-				let an = ((opcode >> 9) & 0x7) as u8;
-				let mode = ((opcode >> 3) & 0x7) as u8;
-				let reg = (opcode & 0x7) as u8;
-				let src = self.decode_ea(mode, reg, size);
-				Instruction {
-					operation: Operation::Movea,
-					size: Some(size),
-					src: Some(src),
-					dst: Some(Operand::AddressRegister(an)),
-				}
-			}
-			// MOVE.B <ea>,CCR
-			0x42C0..=0x42FF => {
-				let mode = ((opcode >> 3) & 0x7) as u8;
-				let reg = (opcode & 0x7) as u8;
-				let src = self.decode_ea(mode, reg, Size::Byte);
-				Instruction {
-					operation: Operation::MoveCcr,
-					size: Some(Size::Byte),
-					src: Some(src),
-					dst: None,
-				}
-			}
-			// MOVE.W <ea>,SR
-			0x46C0..=0x46FF => {
-				let mode = ((opcode >> 3) & 0x7) as u8;
-				let reg = (opcode & 0x7) as u8;
-				let src = self.decode_ea(mode, reg, Size::Word);
-				Instruction {
-					operation: Operation::MoveSr,
-					size: Some(Size::Word),
-					src: Some(src),
-					dst: None,
-				}
-			}
-			// MOVE USP,An or MOVE An,USP
-			0x4E60..=0x4E67 => {
-				let direction = (opcode >> 3) & 0x1; // 0: USP to An, 1: An to USP
-				let an = (opcode & 0x7) as u8;
-				let (src, dst) = if direction == 0 {
-					(Operand::Immediate(0), Operand::AddressRegister(an)) // USP as src not directly addressable here
+			},
+			0x6E00..=0x6EFF => { // BGT <displacement>
+				let disp = if (opcode & 0x00FF) == 0 {
+					self.fetch_word() as i16 as i32
 				} else {
-					(Operand::AddressRegister(an), Operand::Immediate(0)) // USP as dst
+					(opcode & 0x00FF) as i8 as i32
 				};
 				Instruction {
-					operation: Operation::MoveUsp,
-					size: Some(Size::Long),
-					src: Some(src),
-					dst: Some(dst),
-				}
-			}
-			// ANDI.B #<data>,CCR
-			0x023C => {
-				let immediate = self.fetch_word() as u32 & 0xFF;
-				Instruction {
-					operation: Operation::AndiCcr,
-					size: Some(Size::Byte),
-					src: Some(Operand::Immediate(immediate)),
+					operation: Operation::Bgt,
+					size: None,
+					src: Some(Operand::Immediate(disp as u32)),
 					dst: None,
 				}
-			}
-			// ORI.B #<data>,CCR
-			0x003C => {
-				let immediate = self.fetch_word() as u32 & 0xFF;
-				Instruction {
-					operation: Operation::OriCcr,
-					size: Some(Size::Byte),
-					src: Some(Operand::Immediate(immediate)),
-					dst: None,
-				}
-			}
-			// EORI.B #<data>,CCR
-			0x0A3C => {
-				let immediate = self.fetch_word() as u32 & 0xFF;
-				Instruction {
-					operation: Operation::EoriCcr,
-					size: Some(Size::Byte),
-					src: Some(Operand::Immediate(immediate)),
-					dst: None,
-				}
-			}
-			// LSL.<size> <ea>
-			0xE3C0..=0xE3F8 if (opcode & 0xF1C0) == 0xE3C0 => {
-				let size = match (opcode >> 6) & 0x3 {
-					0 => Size::Byte,
-					1 => Size::Word,
-					2 => Size::Long,
-					_ => unreachable!(),
-				};
-				let mode = ((opcode >> 3) & 0x7) as u8;
-				let reg = (opcode & 0x7) as u8;
-				let dst = self.decode_ea(mode, reg, size);
-				Instruction {
-					operation: Operation::LslMem,
-					size: Some(size),
-					src: Some(Operand::Immediate(1)), // Shift by 1
-					dst: Some(dst),
-				}
-			}
-			// ASR.<size> Dx,Dy or #<data>,Dy
-			0xE000..=0xE07F if (opcode & 0xFEE0) == 0xE000 => {
-				let size = match (opcode >> 6) & 0x3 {
-					0 => Size::Byte,
-					1 => Size::Word,
-					2 => Size::Long,
-					_ => unreachable!(),
-				};
-				let count = ((opcode >> 9) & 0x7) as u8;
-				let dr = (opcode >> 5) & 0x1; // 0: immediate, 1: register
-				let dst_reg = (opcode & 0x7) as u8;
-				let src = if dr == 0 {
-					Operand::Immediate(if count == 0 { 8 } else { count as u32 })
+			},
+			0x6F00..=0x6FFF => { // BLE <displacement>
+				let disp = if (opcode & 0x00FF) == 0 {
+					self.fetch_word() as i16 as i32
 				} else {
-					Operand::DataRegister(count)
+					(opcode & 0x00FF) as i8 as i32
 				};
 				Instruction {
-					operation: Operation::Asr,
-					size: Some(size),
-					src: Some(src),
-					dst: Some(Operand::DataRegister(dst_reg)),
+					operation: Operation::Ble,
+					size: None,
+					src: Some(Operand::Immediate(disp as u32)),
+					dst: None,
+				}
+			},
+
+			// Default case
+			_ => {
+				self.trigger_exception(4); // Illegal Instruction
+				Instruction {
+					operation: Operation::Nop,
+					size: None,
+					src: None,
+					dst: None,
 				}
 			}
-			_ => panic!("Unimplemented opcode: {:04X} at PC: {:06X}", opcode, self.pc - 2),
 		}
 	}
 
@@ -2170,8 +2112,9 @@ impl CPU {
 		match instr.operation {
 			Operation::Nop => cycles = 4, // Correct: 2n
 			Operation::Rts => {
-				self.pc = self.memory.read_long(self.a[7]);
+				self.pc = self.cpu_read_long(self.a[7]);
 				self.a[7] += 4;
+				self.prefetch();
 				cycles = 16; // Correct: 8n
 			}
 			Operation::Move => {
@@ -2182,7 +2125,7 @@ impl CPU {
 				self.set_operand_value(size, &dst, value);
 				let n = (value & (1 << (size.bits() - 1))) != 0;
 				let z = value == 0;
-				self.set_flags(n, z, false, false);
+				self.set_flags(n, z, false, false, false); // X = false if not affected
 				cycles = match size {
 					Size::Byte | Size::Word => 4,
 					Size::Long => 8,
@@ -2223,7 +2166,7 @@ impl CPU {
 				self.set_operand_value(size, &dst, result);
 				let n = (result & (1 << (size.bits() - 1))) != 0;
 				let z = result == 0;
-				self.set_flags(n, z, overflow, carry);
+				self.set_flags(n, z, overflow, carry, carry); // X = C for arithmetic ops
 				cycles = match size {
 					Size::Byte | Size::Word => 4,
 					Size::Long => 8,
@@ -2239,9 +2182,9 @@ impl CPU {
 				self.set_operand_value(Size::Long, &dst, result as u32);
 				let n = result < 0;
 				let z = result == 0;
-				self.set_flags(n, z, false, false);
-				let ones = (src_val as u16 as u32 & 0xFFFF).count_ones(); // Dynamic timing
-				cycles = 38 + 2 * ones + self.ea_cycles(&src, size); // 19n + 1n per '1' bit
+				self.set_flags(n, z, false, false, false);
+				let _ones = (src_val as u16 as u32 & 0xFFFF).count_ones(); // Dynamic timing
+				cycles = 38 + 2 * (src_val as u16).count_ones() + self.ea_cycles(&src, size);
 			}
 			Operation::Divu => {
 				let size = instr.size.unwrap();
@@ -2259,7 +2202,7 @@ impl CPU {
 				let n = (quotient & 0x8000) != 0;
 				let z = quotient == 0;
 				let v = quotient > 0xFFFF;
-				self.set_flags(n, z, v, false);
+				self.set_flags(n, z, v, false, false);
 				cycles = 76; // Base: 38n
 				if dividend != 0 && divisor != 0 {
 					let quotient_bits = 32 - (dividend / divisor).leading_zeros();
@@ -2279,7 +2222,7 @@ impl CPU {
 				self.set_operand_value(size, &dst, result);
 				let n = (result & (1 << (size.bits() - 1))) != 0;
 				let z = result == 0;
-				self.set_flags(n, z, false, false);
+				self.set_flags(n, z, false, false, false);
 				cycles = match size {
 					Size::Byte | Size::Word => 4,
 					Size::Long => 8,
@@ -2295,7 +2238,7 @@ impl CPU {
 				let z = result == 0;
 				let v = dst_val != 0;
 				let c = dst_val != 0;
-				self.set_flags(n, z, v, c);
+				self.set_flags(n, z, v, c, c);
 				cycles = match size {
 					Size::Byte | Size::Word => 4,
 					Size::Long => 6,
@@ -2307,7 +2250,7 @@ impl CPU {
 				let src_val = self.get_operand_value(size, &src);
 				let n = (src_val & (1 << (size.bits() - 1))) != 0;
 				let z = src_val == 0;
-				self.set_flags(n, z, false, false);
+				self.set_flags(n, z, false, false, false);
 				cycles = 4 + self.ea_cycles(&src, size);
 			}
 			Operation::Lsr => {
@@ -2321,7 +2264,7 @@ impl CPU {
 				let n = (result & (1 << (size.bits() - 1))) != 0;
 				let z = result == 0;
 				let c = if shift_count > 0 { (dst_val >> (shift_count - 1)) & 1 != 0 } else { false };
-				self.set_flags(n, z, false, c);
+				self.set_flags(n, z, false, c, c); // X = C
 				cycles = match size {
 					Size::Byte | Size::Word => 6,
 					Size::Long => 8,
@@ -2342,7 +2285,7 @@ impl CPU {
 					let bit = (dst_val >> (size.bits() - 1 - i)) & 1;
 					bit != (dst_val >> (size.bits() - 1)) & 1
 				});
-				self.set_flags(n, z, v, c);
+				self.set_flags(n, z, v, c, c);
 				cycles = match size {
 					Size::Byte | Size::Word => 6,
 					Size::Long => 8,
@@ -2355,7 +2298,7 @@ impl CPU {
 				self.set_operand_value(Size::Long, &dst, value);
 				let n = (value & 0x80000000) != 0;
 				let z = value == 0;
-				self.set_flags(n, z, false, false);
+				self.set_flags(n, z, false, false, false);
 				cycles = 4; // Correct: 2n
 			}
 			Operation::Ror => {
@@ -2370,7 +2313,7 @@ impl CPU {
 				let n = (result & (1 << (size.bits() - 1))) != 0;
 				let z = result == 0;
 				let c = if shift_count > 0 { (dst_val >> (shift_count - 1)) & 1 != 0 } else { false };
-				self.set_flags(n, z, false, c);
+				self.set_flags(n, z, false, c, c);
 				cycles = match size {
 					Size::Byte | Size::Word => 6,
 					Size::Long => 8,
@@ -2386,7 +2329,7 @@ impl CPU {
 				self.set_operand_value(size, &dst, result);
 				let n = (result & (1 << (size.bits() - 1))) != 0;
 				let z = result == 0;
-				self.set_flags(n, z, false, false);
+				self.set_flags(n, z, false, false, false);
 				cycles = match size {
 					Size::Byte | Size::Word => 8,
 					Size::Long => 12,
@@ -2403,7 +2346,7 @@ impl CPU {
 				let z = result == 0;
 				let v = ((dst_val & !imm & !result) | (!dst_val & imm & result)) & (1 << (size.bits() - 1)) != 0;
 				let c = ((!dst_val & imm) | (result & !dst_val) | (imm & result)) & (1 << (size.bits() - 1)) != 0;
-				self.set_flags(n, z, v, c);
+				self.set_flags(n, z, v, c, c);
 				cycles = match size {
 					Size::Byte => 8,
 					Size::Word => 8,
@@ -2420,7 +2363,7 @@ impl CPU {
 						let count = if size == Size::Word { 2 } else { 4 };
 						let mut value = 0;
 						for _ in 0..count {
-							value = (value << 8) | (self.memory.read_byte(addr) as u32);
+							value = (value << 8) | (self.cpu_read_byte(addr) as u32);
 							addr += 2;
 						}
 						self.d[dreg as usize] = value;
@@ -2431,7 +2374,7 @@ impl CPU {
 						let mut addr = self.a[areg as usize].wrapping_add(disp as u32);
 						let count = if size == Size::Word { 2 } else { 4 };
 						for i in (0..count).rev() {
-							self.memory.write_byte(addr, (value >> (8 * i)) & 0xFF);
+							self.cpu_write_byte(addr, ((value >> (8 * i)) & 0xFF) as u8);
 							addr += 2;
 						}
 					}
@@ -2447,7 +2390,7 @@ impl CPU {
 				let z = (dst_val & (1 << bit_number)) == 0;
 				let result = dst_val & !(1 << bit_number);
 				self.set_operand_value(size, &dst, result);
-				self.set_flags(false, z, false, false);
+				self.set_flags(false, z, false, false, false);
 				cycles = if matches!(dst, Operand::DataRegister(_)) { 10 } else { 14 } + self.ea_cycles(&dst, size);
 			}
 			Operation::Lea => {
@@ -2484,7 +2427,7 @@ impl CPU {
 					self.d[reg as usize] = result;
 					let n = (result & (1 << (size.bits() - 1))) != 0;
 					let z = result == 0;
-					self.set_flags(n, z, false, false);
+					self.set_flags(n, z, false, false, false);
 				}
 				cycles = 4; // Correct: 2n
 			}
@@ -2523,7 +2466,7 @@ impl CPU {
 				self.set_operand_value(size, &dst, result);
 				let n = (result & (1 << (size.bits() - 1))) != 0;
 				let z = result == 0;
-				self.set_flags(n, z, overflow, carry);
+				self.set_flags(n, z, overflow, carry, carry);
 				cycles = match size {
 					Size::Byte | Size::Word => 4,
 					Size::Long => 8,
@@ -2539,7 +2482,7 @@ impl CPU {
 				self.set_operand_value(size, &dst, result);
 				let n = (result & (1 << (size.bits() - 1))) != 0;
 				let z = result == 0;
-				self.set_flags(n, z, false, false);
+				self.set_flags(n, z, false, false, false);
 				cycles = match size {
 					Size::Byte | Size::Word => 8,
 					Size::Long => 14, // Adjusted: 7n
@@ -2555,7 +2498,7 @@ impl CPU {
 				self.set_operand_value(size, &dst, result);
 				let n = (result & (1 << (size.bits() - 1))) != 0;
 				let z = result == 0;
-				self.set_flags(n, z, false, false);
+				self.set_flags(n, z, false, false, false);
 				cycles = match size {
 					Size::Byte | Size::Word => 8,
 					Size::Long => 14, // Adjusted: 7n
@@ -2600,7 +2543,7 @@ impl CPU {
 				self.set_operand_value(size, &dst, result);
 				let n = (result & (1 << (size.bits() - 1))) != 0;
 				let z = if self.sr & 0x4 != 0 && result == 0 { true } else { false };
-				self.set_flags(n, z, overflow, carry);
+				self.set_flags(n, z, overflow, carry, carry); // X = C
 				cycles = match size {
 					Size::Byte | Size::Word => 4,
 					Size::Long => 8,
@@ -2645,7 +2588,7 @@ impl CPU {
 				self.set_operand_value(size, &dst, result);
 				let n = (result & (1 << (size.bits() - 1))) != 0;
 				let z = if self.sr & 0x4 != 0 && result == 0 { true } else { false };
-				self.set_flags(n, z, overflow, carry);
+				self.set_flags(n, z, overflow, carry, carry);
 				cycles = match size {
 					Size::Byte | Size::Word => 4,
 					Size::Long => 8,
@@ -2654,12 +2597,14 @@ impl CPU {
 			Operation::Bra => {
 				let disp = self.get_operand_value(Size::Long, &instr.src.unwrap()) as i32;
 				self.pc = (self.pc as i32 + disp) as u32;
+				self.prefetch();
 				cycles = 10; // Correct: 5n (taken only)
 			}
 			Operation::Beq => {
 				let disp = self.get_operand_value(Size::Long, &instr.src.unwrap()) as i32;
 				if self.sr & 0x4 != 0 {
 					self.pc = (self.pc as i32 + disp) as u32;
+					self.prefetch();
 					cycles = 10; // Taken: 5n
 				} else {
 					cycles = 12; // Not taken: 6n
@@ -2669,6 +2614,7 @@ impl CPU {
 				let disp = self.get_operand_value(Size::Long, &instr.src.unwrap()) as i32;
 				if self.sr & 0x4 == 0 {
 					self.pc = (self.pc as i32 + disp) as u32;
+					self.prefetch();
 					cycles = 10; // Taken: 5n
 				} else {
 					cycles = 12; // Not taken: 6n
@@ -2678,7 +2624,7 @@ impl CPU {
 				let size = instr.size.unwrap();
 				let dst = instr.dst.unwrap();
 				self.set_operand_value(size, &dst, 0);
-				self.set_flags(false, true, false, false);
+				self.set_flags(false, true, false, false, false);
 				cycles = match size {
 					Size::Byte | Size::Word => 4,
 					Size::Long => 6,
@@ -2692,7 +2638,7 @@ impl CPU {
 					self.d[reg as usize] = result;
 					let n = (result & 0x80000000) != 0;
 					let z = result == 0;
-					self.set_flags(n, z, false, false);
+					self.set_flags(n, z, false, false, false);
 				}
 				cycles = 4; // Correct: 2n
 			}
@@ -2707,7 +2653,7 @@ impl CPU {
 				let z = result == 0;
 				let v = ((dst_val & !src_val & !result) | (!dst_val & src_val & result)) & 0x80000000 != 0;
 				let c = ((!dst_val & src_val) | (result & (!dst_val | src_val))) & 0x80000000 != 0;
-				self.set_flags(n, z, v, c);
+				self.set_flags(n, z, v, c, c);
 				cycles = 6 + self.ea_cycles(&src, size); // Correct: 3n
 			}
 			Operation::Chk => {
@@ -2720,7 +2666,7 @@ impl CPU {
 				}
 				let n = dst_val < 0;
 				let z = dst_val == 0;
-				self.set_flags(n, z, false, false);
+				self.set_flags(n, z, false, false, false);
 				cycles = 10 + self.ea_cycles(&src, Size::Word);
 			}
 			Operation::Tas => {
@@ -2728,8 +2674,8 @@ impl CPU {
 				let val = self.get_operand_value(Size::Byte, &dst) as u8;
 				let n = (val & 0x80) != 0;
 				let z = val == 0;
-				self.set_flags(n, z, false, false);
-				self.set_operand_value(Size::Byte, &dst, val | 0x80);
+				self.set_flags(n, z, false, false, false);
+				self.set_operand_value(Size::Byte, &dst, (val | 0x80) as u32);
 				cycles = if matches!(dst, Operand::DataRegister(_)) { 4 } else { 14 } + self.ea_cycles(&dst, Size::Byte);
 			}
 			Operation::Rol => {
@@ -2743,7 +2689,7 @@ impl CPU {
 				let n = (result & (1 << (size.bits() - 1))) != 0;
 				let z = result == 0;
 				let c = if shift_count > 0 { (dst_val & (1 << (size.bits() - shift_count))) != 0 } else { false };
-				self.set_flags(n, z, false, c);
+				self.set_flags(n, z, false, c, c);
 				cycles = match size {
 					Size::Byte | Size::Word => 6,
 					Size::Long => 8,
@@ -2757,13 +2703,13 @@ impl CPU {
 				let dst_val = self.get_operand_value(size, &dst);
 				let x = (self.sr & 0x1) != 0;
 				let shift = size.bits();
-				let full_val = if x { (dst_val | (1 << shift)) } else { dst_val };
+				let full_val = if x { dst_val | (1 << shift) } else { dst_val };
 				let result = if shift_count == 0 { dst_val } else { full_val.rotate_left(shift_count) & size.mask() };
 				self.set_operand_value(size, &dst, result);
 				let n = (result & (1 << (shift - 1))) != 0;
 				let z = result == 0;
 				let c = if shift_count > 0 { (full_val & (1 << (shift + 1 - shift_count))) != 0 } else { false };
-				self.set_flags(n, z, false, c);
+				self.set_flags(n, z, false, c, c);
 				self.sr = (self.sr & 0xFFFE) | (if c { 1 } else { 0 });
 				cycles = match size {
 					Size::Byte | Size::Word => 6,
@@ -2774,7 +2720,7 @@ impl CPU {
 				let src = instr.src.unwrap();
 				let addr = self.get_operand_value(Size::Long, &src);
 				self.a[7] -= 4;
-				self.memory.write_long(self.a[7], self.pc);
+				self.cpu_write_long(self.a[7], self.pc);
 				self.pc = addr;
 				cycles = match src {
 					Operand::Displacement(_, _) => 18,
@@ -2792,7 +2738,7 @@ impl CPU {
 				let z = (val & (1 << bit_num)) == 0;
 				let result = val ^ (1 << bit_num);
 				self.set_operand_value(size, &dst, result);
-				self.set_flags(false, z, false, false);
+				self.set_flags(false, z, false, false, false);
 				cycles = if matches!(dst, Operand::DataRegister(_)) { 8 } else { 12 } + self.ea_cycles(&dst, size);
 			}
 			Operation::Bset => {
@@ -2804,7 +2750,7 @@ impl CPU {
 				let z = (val & (1 << bit_num)) == 0;
 				let result = val | (1 << bit_num);
 				self.set_operand_value(size, &dst, result);
-				self.set_flags(false, z, false, false);
+				self.set_flags(false, z, false, false, false);
 				cycles = if matches!(dst, Operand::DataRegister(_)) { 8 } else { 12 } + self.ea_cycles(&dst, size);
 			}
 			Operation::Btst => {
@@ -2814,16 +2760,17 @@ impl CPU {
 				let bit_num = self.get_operand_value(Size::Long, &src) % size.bits();
 				let val = self.get_operand_value(size, &dst);
 				let z = (val & (1 << bit_num)) == 0;
-				self.set_flags(false, z, false, false);
+				self.set_flags(false, z, false, false, false);
 				cycles = if matches!(dst, Operand::DataRegister(_)) { 6 } else { 4 } + self.ea_cycles(&dst, size);
 			}
 			Operation::Trap => {
 				let vector = self.get_operand_value(Size::Long, &instr.src.unwrap());
 				self.a[7] -= 4;
-				self.memory.write_long(self.a[7], self.pc);
+				self.cpu_write_long(self.a[7], self.pc);
 				self.a[7] -= 2;
-				self.memory.write_word(self.a[7], self.sr);
-				self.pc = self.memory.read_long(32 + vector * 4);
+				self.cpu_write_word(self.a[7], self.sr);
+				self.pc = self.cpu_read_long(32 + vector * 4);
+				self.prefetch();
 				cycles = 34; // Correct: 17n
 			}
 			Operation::And => {
@@ -2836,7 +2783,7 @@ impl CPU {
 				self.set_operand_value(size, &dst, result);
 				let n = (result & (1 << (size.bits() - 1))) != 0;
 				let z = result == 0;
-				self.set_flags(n, z, false, false);
+				self.set_flags(n, z, false, false, false);
 				cycles = match size {
 					Size::Byte | Size::Word => 4,
 					Size::Long => 6,
@@ -2852,7 +2799,7 @@ impl CPU {
 				self.set_operand_value(size, &dst, result);
 				let n = (result & (1 << (size.bits() - 1))) != 0;
 				let z = result == 0;
-				self.set_flags(n, z, false, false);
+				self.set_flags(n, z, false, false, false);
 				cycles = match size {
 					Size::Byte | Size::Word => 4,
 					Size::Long => 6,
@@ -2893,7 +2840,7 @@ impl CPU {
 				self.set_operand_value(size, &dst, result);
 				let n = (result & (1 << (size.bits() - 1))) != 0;
 				let z = result == 0;
-				self.set_flags(n, z, overflow, carry);
+				self.set_flags(n, z, overflow, carry, carry);
 				cycles = match size {
 					Size::Byte | Size::Word => 4,
 					Size::Long => 8,
@@ -2934,7 +2881,7 @@ impl CPU {
 				self.set_operand_value(size, &dst, result);
 				let n = (result & (1 << (size.bits() - 1))) != 0;
 				let z = result == 0;
-				self.set_flags(n, z, overflow, carry);
+				self.set_flags(n, z, overflow, carry, carry);
 				cycles = match size {
 					Size::Byte | Size::Word => 4,
 					Size::Long => 8,
@@ -2948,7 +2895,7 @@ impl CPU {
 				self.set_operand_value(size, &dst, result);
 				let n = (result & (1 << (size.bits() - 1))) != 0;
 				let z = result == 0;
-				self.set_flags(n, z, false, false);
+				self.set_flags(n, z, false, false, false);
 				cycles = match size {
 					Size::Byte | Size::Word => 4,
 					Size::Long => 6,
@@ -2970,7 +2917,7 @@ impl CPU {
 				let n = (quotient & 0x8000) != 0;
 				let z = quotient == 0;
 				let v = quotient > 0x7FFF || quotient < -0x8000;
-				self.set_flags(n, z, v, false);
+				self.set_flags(n, z, v, false, false);
 				cycles = 96; // Base: 48n
 				if dividend != 0 && divisor != 0 {
 					let quotient_abs = quotient.abs() as u32;
@@ -2991,13 +2938,13 @@ impl CPU {
 				let dst_val = self.get_operand_value(size, &dst);
 				let x = (self.sr & 0x1) != 0;
 				let shift = size.bits();
-				let full_val = if x { (dst_val | (1 << shift)) } else { dst_val };
+				let full_val = if x { dst_val | (1 << shift) } else { dst_val };
 				let result = if shift_count == 0 { dst_val } else { full_val.rotate_right(shift_count) & size.mask() };
 				self.set_operand_value(size, &dst, result);
 				let n = (result & (1 << (shift - 1))) != 0;
 				let z = result == 0;
 				let c = if shift_count > 0 { (full_val & (1 << (shift_count - 1))) != 0 } else { false };
-				self.set_flags(n, z, false, c);
+				self.set_flags(n, z, false, c, c);
 				self.sr = (self.sr & 0xFFFE) | (if c { 1 } else { 0 });
 				cycles = match size {
 					Size::Byte | Size::Word => 6,
@@ -3010,6 +2957,7 @@ impl CPU {
 				let c = (self.sr & 0x1) != 0;
 				if !c && !z {
 					self.pc = (self.pc as i32 + disp) as u32;
+					self.prefetch();
 					cycles = 10; // Taken: 5n
 				} else {
 					cycles = 12; // Not taken: 6n
@@ -3021,6 +2969,7 @@ impl CPU {
 				let c = (self.sr & 0x1) != 0;
 				if c || z {
 					self.pc = (self.pc as i32 + disp) as u32;
+					self.prefetch();
 					cycles = 10; // Taken: 5n
 				} else {
 					cycles = 12; // Not taken: 6n
@@ -3030,6 +2979,7 @@ impl CPU {
 				let src = instr.src.unwrap();
 				let addr = self.get_operand_value(Size::Long, &src);
 				self.pc = addr;
+				self.prefetch();
 				cycles = match src {
 					Operand::Displacement(_, _) => 10,
 					Operand::AbsoluteShort(_) => 10,
@@ -3048,6 +2998,7 @@ impl CPU {
 				cycles = match size {
 					Size::Word => 8,
 					Size::Long => 6,
+					Size::Byte => 8,
 				} + self.ea_cycles(&src, size);
 			}
 			Operation::Suba => {
@@ -3061,6 +3012,7 @@ impl CPU {
 				cycles = match size {
 					Size::Word => 8,
 					Size::Long => 6,
+					Size::Byte => 8,
 				} + self.ea_cycles(&src, size);
 			}
 			Operation::Mulu => {
@@ -3073,7 +3025,7 @@ impl CPU {
 				self.set_operand_value(Size::Long, &dst, result);
 				let n = (result & 0x80000000) != 0;
 				let z = result == 0;
-				self.set_flags(n, z, false, false);
+				self.set_flags(n, z, false, false, false);
 				let ones = src_val.count_ones(); // Dynamic timing
 				cycles = 38 + 2 * ones + self.ea_cycles(&src, size); // 19n + 1n per '1' bit
 			}
@@ -3088,7 +3040,7 @@ impl CPU {
 				let z = result == 0;
 				let v = ((dst_val & !src_val & !result) | (!dst_val & src_val & result)) & (1 << (size.bits() - 1)) != 0;
 				let c = ((!dst_val & src_val) | (result & (!dst_val | src_val))) & (1 << (size.bits() - 1)) != 0;
-				self.set_flags(n, z, v, c);
+				self.set_flags(n, z, v, c, c);
 				cycles = match size {
 					Size::Byte | Size::Word => 4,
 					Size::Long => 6,
@@ -3111,6 +3063,7 @@ impl CPU {
 				let c = (self.sr & 0x1) != 0;
 				if !c && new_val != 0xFFFF {
 					self.pc = (self.pc as i32 + disp) as u32;
+					self.prefetch();
 					cycles = 10; // Taken: 5n
 				} else {
 					cycles = 14; // Not taken: 7n
@@ -3126,7 +3079,7 @@ impl CPU {
 					_ => panic!("Unsupported addressing mode for PEA: {:?}", src),
 				};
 				self.a[7] -= 4;
-				self.memory.write_long(self.a[7], addr);
+				self.cpu_write_long(self.a[7], addr);
 				cycles = match src {
 					Operand::Displacement(_, _) => 12,
 					Operand::AbsoluteShort(_) => 12,
@@ -3139,7 +3092,7 @@ impl CPU {
 				let disp = self.get_operand_value(Size::Long, &instr.src.unwrap()) as i32;
 				if let Operand::AddressRegister(reg) = an {
 					self.a[7] -= 4;
-					self.memory.write_long(self.a[7], self.a[reg as usize]);
+					self.cpu_write_long(self.a[7], self.a[reg as usize]);
 					self.a[reg as usize] = self.a[7];
 					self.a[7] = (self.a[7] as i32 + disp) as u32;
 				}
@@ -3149,7 +3102,7 @@ impl CPU {
 				let an = instr.dst.unwrap();
 				if let Operand::AddressRegister(reg) = an {
 					self.a[7] = self.a[reg as usize];
-					self.a[reg as usize] = self.memory.read_long(self.a[7]);
+					self.a[reg as usize] = self.cpu_read_long(self.a[7]);
 					self.a[7] += 4;
 				}
 				cycles = 12; // Correct: 6n
@@ -3164,6 +3117,7 @@ impl CPU {
 				let v = (self.sr & 0x2) != 0;
 				if !z && (n == v) {
 					self.pc = (self.pc as i32 + disp) as u32;
+					self.prefetch();
 					cycles = 10; // Taken: 5n
 				} else {
 					cycles = 12; // Not taken: 6n
@@ -3176,6 +3130,7 @@ impl CPU {
 				let v = (self.sr & 0x2) != 0;
 				if z || (n != v) {
 					self.pc = (self.pc as i32 + disp) as u32;
+					self.prefetch();
 					cycles = 10; // Taken: 5n
 				} else {
 					cycles = 12; // Not taken: 6n
@@ -3213,11 +3168,11 @@ impl CPU {
 						if (reglist & (1 << bit)) != 0 {
 							let value = if i < 8 { self.d[i] } else { self.a[i - 8] };
 							if size == Size::Word {
-								self.memory.write_word(addr, value as u16);
+								self.cpu_write_word(addr, value as u16);
 								addr += 2;
 								cycles += 4;
 							} else {
-								self.memory.write_long(addr, value);
+								self.cpu_write_long(addr, value);
 								addr += 4;
 								cycles += 8;
 							}
@@ -3228,12 +3183,12 @@ impl CPU {
 					for i in 0..16 {
 						if (reglist & (1 << bit)) != 0 {
 							let value = if size == Size::Word {
-								let val = self.memory.read_word(addr) as u32;
+								let val = self.cpu_read_word(addr) as u32;
 								addr += 2;
 								cycles += 4;
 								val
 							} else {
-								let val = self.memory.read_long(addr);
+								let val = self.cpu_read_long(addr);
 								addr += 4;
 								cycles += 8;
 								val
@@ -3255,7 +3210,7 @@ impl CPU {
 				let z = result == 0;
 				let c = (dst_val & (1 << (size.bits() - 1))) != 0;
 				let v = (dst_val & (1 << (size.bits() - 1))) != (result & (1 << (size.bits() - 1)));
-				self.set_flags(n, z, v, c);
+				self.set_flags(n, z, v, c, c);
 				cycles = 8 + self.ea_cycles(&dst, size);
 			}
 			Operation::LsrMem => {
@@ -3267,14 +3222,14 @@ impl CPU {
 				let n = (result & (1 << (size.bits() - 1))) != 0;
 				let z = result == 0;
 				let c = (dst_val & 1) != 0;
-				self.set_flags(n, z, false, c);
+				self.set_flags(n, z, false, c, c); // X = C
 				cycles = 8 + self.ea_cycles(&dst, size);
 			}
 			Operation::ClrMem => {
 				let size = instr.size.unwrap();
 				let dst = instr.dst.unwrap();
 				self.set_operand_value(size, &dst, 0);
-				self.set_flags(false, true, false, false);
+				self.set_flags(false, true, false, false, false);
 				cycles = match size {
 					Size::Byte | Size::Word => 4,
 					Size::Long => 6,
@@ -3292,8 +3247,9 @@ impl CPU {
 			}
 			Operation::Rtd => {
 				let disp = self.get_operand_value(Size::Long, &instr.src.unwrap()) as i32;
-				self.pc = self.memory.read_long(self.a[7]);
+				self.pc = self.cpu_read_long(self.a[7]);
 				self.a[7] += 4 + disp as u32;
+				self.prefetch();
 				cycles = 16; // Correct: 8n
 			}
 			Operation::TasMem => {
@@ -3301,14 +3257,15 @@ impl CPU {
 				let val = self.get_operand_value(Size::Byte, &dst) as u8;
 				let n = (val & 0x80) != 0;
 				let z = val == 0;
-				self.set_flags(n, z, false, false);
-				self.set_operand_value(Size::Byte, &dst, val | 0x80);
+				self.set_flags(n, z, false, false, false);
+				self.set_operand_value(Size::Byte, &dst, (val | 0x80) as u32);
 				cycles = if matches!(dst, Operand::DataRegister(_)) { 4 } else { 14 } + self.ea_cycles(&dst, Size::Byte);
 			}
 			Operation::Bcc => {
 				let disp = self.get_operand_value(Size::Long, &instr.src.unwrap()) as i32;
 				if (self.sr & 0x1) == 0 {
 					self.pc = (self.pc as i32 + disp) as u32;
+					self.prefetch();
 					cycles = 10; // Taken: 5n
 				} else {
 					cycles = 12; // Not taken: 6n
@@ -3318,6 +3275,7 @@ impl CPU {
 				let disp = self.get_operand_value(Size::Long, &instr.src.unwrap()) as i32;
 				if (self.sr & 0x1) != 0 {
 					self.pc = (self.pc as i32 + disp) as u32;
+					self.prefetch();
 					cycles = 10; // Taken: 5n
 				} else {
 					cycles = 12; // Not taken: 6n
@@ -3329,6 +3287,7 @@ impl CPU {
 				let v = (self.sr & 0x2) != 0;
 				if n == v {
 					self.pc = (self.pc as i32 + disp) as u32;
+					self.prefetch();
 					cycles = 10; // Taken: 5n
 				} else {
 					cycles = 12; // Not taken: 6n
@@ -3340,6 +3299,7 @@ impl CPU {
 				let v = (self.sr & 0x2) != 0;
 				if n != v {
 					self.pc = (self.pc as i32 + disp) as u32;
+					self.prefetch();
 					cycles = 10; // Taken: 5n
 				} else {
 					cycles = 12; // Not taken: 6n
@@ -3349,6 +3309,7 @@ impl CPU {
 				let disp = self.get_operand_value(Size::Long, &instr.src.unwrap()) as i32;
 				if (self.sr & 0x8) != 0 {
 					self.pc = (self.pc as i32 + disp) as u32;
+					self.prefetch();
 					cycles = 10; // Taken: 5n
 				} else {
 					cycles = 12; // Not taken: 6n
@@ -3358,6 +3319,7 @@ impl CPU {
 				let disp = self.get_operand_value(Size::Long, &instr.src.unwrap()) as i32;
 				if (self.sr & 0x8) == 0 {
 					self.pc = (self.pc as i32 + disp) as u32;
+					self.prefetch();
 					cycles = 10; // Taken: 5n
 				} else {
 					cycles = 12; // Not taken: 6n
@@ -3374,7 +3336,7 @@ impl CPU {
 				let n = (result & (1 << (size.bits() - 1))) != 0;
 				let z = result == 0;
 				let c = if shift_count > 0 { (dst_val & (1 << (size.bits() - shift_count))) != 0 } else { false };
-				self.set_flags(n, z, false, c);
+				self.set_flags(n, z, false, c, c);
 				cycles = match size {
 					Size::Byte | Size::Word => 6,
 					Size::Long => 8,
@@ -3389,7 +3351,7 @@ impl CPU {
 				let n = (result & (1 << (size.bits() - 1))) != 0;
 				let z = result == 0;
 				let c = (dst_val & (1 << (size.bits() - 1))) != 0;
-				self.set_flags(n, z, false, c);
+				self.set_flags(n, z, false, c, c);
 				cycles = 8 + self.ea_cycles(&dst, size);
 			}
 			Operation::RorMem => {
@@ -3401,7 +3363,7 @@ impl CPU {
 				let n = (result & (1 << (size.bits() - 1))) != 0;
 				let z = result == 0;
 				let c = (dst_val & 1) != 0;
-				self.set_flags(n, z, false, c);
+				self.set_flags(n, z, false, c, c);
 				cycles = 8 + self.ea_cycles(&dst, size);
 			}
 			Operation::Subi => {
@@ -3439,7 +3401,7 @@ impl CPU {
 				self.set_operand_value(size, &dst, result);
 				let n = (result & (1 << (size.bits() - 1))) != 0;
 				let z = result == 0;
-				self.set_flags(n, z, overflow, carry);
+				self.set_flags(n, z, overflow, carry, carry);
 				cycles = match size {
 					Size::Byte | Size::Word => 8,
 					Size::Long => 14, // Adjusted: 7n
@@ -3459,7 +3421,7 @@ impl CPU {
 				self.set_operand_value(Size::Byte, &dst, result as u32);
 				let n = (result & 0x80) != 0;
 				let z = if self.sr & 0x4 != 0 && result == 0 { true } else { false };
-				self.set_flags(n, z, false, c);
+				self.set_flags(n, z, false, c, c);
 				cycles = if matches!(src, Operand::DataRegister(_)) { 6 } else { 18 }; // Correct: 3n reg, 9n mem
 			}
 			Operation::Sbcd => {
@@ -3477,7 +3439,7 @@ impl CPU {
 				let n = (result_bcd & 0x80) != 0;
 				let z = if self.sr & 0x4 != 0 && result_bcd == 0 { true } else { false };
 				let c = diff < 0;
-				self.set_flags(n, z, false, c);
+				self.set_flags(n, z, false, c, c);
 				cycles = if matches!(src, Operand::DataRegister(_)) { 6 } else { 18 }; // Correct: 3n reg, 9n mem
 			}
 			Operation::Nbcd => {
@@ -3485,14 +3447,14 @@ impl CPU {
 				let dst_val = self.get_operand_value(Size::Byte, &dst) as u8;
 				let x = (self.sr & 0x1) != 0;
 				let dec_val = ((dst_val >> 4) & 0xF) * 10 + (dst_val & 0xF);
-				let result_dec = 0 - dec_val - (if x { 1 } else { 0 });
+				let result_dec: i16 = (0 - dec_val - (if x { 1 } else { 0 })).into();
 				let result = if result_dec < 0 { (100 + result_dec) as u8 } else { result_dec as u8 };
 				let result_bcd = ((result / 10) << 4) | (result % 10);
 				self.set_operand_value(Size::Byte, &dst, result_bcd as u32);
 				let n = (result_bcd & 0x80) != 0;
 				let z = if self.sr & 0x4 != 0 && result_bcd == 0 { true } else { false };
 				let c = result_dec != 0;
-				self.set_flags(n, z, false, c);
+				self.set_flags(n, z, false, c, c);
 				cycles = if matches!(dst, Operand::DataRegister(_)) { 6 } else { 8 }; // Correct: 3n reg, 4n mem
 			}
 			Operation::Addi => {
@@ -3530,7 +3492,7 @@ impl CPU {
 				self.set_operand_value(size, &dst, result);
 				let n = (result & (1 << (size.bits() - 1))) != 0;
 				let z = result == 0;
-				self.set_flags(n, z, overflow, carry);
+				self.set_flags(n, z, overflow, carry, carry);
 				cycles = match size {
 					Size::Byte | Size::Word => 8,
 					Size::Long => 14, // Adjusted: 7n
@@ -3540,6 +3502,7 @@ impl CPU {
 				let disp = self.get_operand_value(Size::Long, &instr.src.unwrap()) as i32;
 				if (self.sr & 0x2) == 0 {
 					self.pc = (self.pc as i32 + disp) as u32;
+					self.prefetch();
 					cycles = 10; // Taken: 5n
 				} else {
 					cycles = 12; // Not taken: 6n
@@ -3549,6 +3512,7 @@ impl CPU {
 				let disp = self.get_operand_value(Size::Long, &instr.src.unwrap()) as i32;
 				if (self.sr & 0x2) != 0 {
 					self.pc = (self.pc as i32 + disp) as u32;
+					self.prefetch();
 					cycles = 10; // Taken: 5n
 				} else {
 					cycles = 12; // Not taken: 6n
@@ -3566,7 +3530,7 @@ impl CPU {
 				let n = (result & (1 << (size.bits() - 1))) != 0;
 				let z = result == 0;
 				let c = (dst_val & (1 << (size.bits() - 1))) != 0;
-				self.set_flags(n, z, false, c);
+				self.set_flags(n, z, false, c, c);
 				self.sr = (self.sr & 0xFFFE) | (if c { 1 } else { 0 });
 				cycles = 8 + self.ea_cycles(&dst, size);
 			}
@@ -3582,7 +3546,7 @@ impl CPU {
 				let n = (result & (1 << (size.bits() - 1))) != 0;
 				let z = result == 0;
 				let c = (dst_val & 1) != 0;
-				self.set_flags(n, z, false, c);
+				self.set_flags(n, z, false, c, c);
 				self.sr = (self.sr & 0xFFFE) | (if c { 1 } else { 0 });
 				cycles = 8 + self.ea_cycles(&dst, size);
 			}
@@ -3597,11 +3561,12 @@ impl CPU {
 				if !self.check_supervisor() {
 					cycles = 34; // Trap cycles
 				} else {
-					self.pc = self.memory.read_long(4);
+					self.pc = self.cpu_read_long(4);
 					self.sr = 0x2700;
 					self.d = [0; 8];
 					self.a = [0; 8];
-					self.a[7] = self.memory.read_long(0);
+					self.a[7] = self.cpu_read_long(0);
+					self.prefetch();
 					cycles = 132; // Correct: External reset timing
 				}
 			}
@@ -3609,11 +3574,12 @@ impl CPU {
 				if !self.check_supervisor() {
 					cycles = 34; // Trap cycles
 				} else {
-					self.sr = self.memory.read_word(self.a[7]);
+					self.sr = self.cpu_read_word(self.a[7]);
 					self.a[7] += 2;
-					self.pc = self.memory.read_long(self.a[7]);
+					self.pc = self.cpu_read_long(self.a[7]);
 					self.a[7] += 4;
 					self.interrupt_nest_level = self.interrupt_nest_level.saturating_sub(1);
+					self.prefetch();
 					cycles = 20; // Correct: 10n
 				}
 			}
@@ -3626,6 +3592,7 @@ impl CPU {
 				cycles = match size {
 					Size::Word => 4,
 					Size::Long => 4,
+					Size::Byte => 4,
 				} + self.ea_cycles(&src, size);
 			}
 			Operation::MoveCcr => {
@@ -3697,7 +3664,7 @@ impl CPU {
 				let n = (result & (1 << (size.bits() - 1))) != 0;
 				let z = result == 0;
 				let c = (dst_val & (1 << (size.bits() - 1))) != 0;
-				self.set_flags(n, z, false, c);
+				self.set_flags(n, z, false, c, c);
 				cycles = 8 + self.ea_cycles(&dst, size);
 			}
 			Operation::Asr => {
@@ -3715,7 +3682,7 @@ impl CPU {
 				let n = (result & (1 << (size.bits() - 1))) != 0;
 				let z = result == 0;
 				let c = if shift_count > 0 { (dst_val >> (shift_count - 1)) & 1 != 0 } else { false };
-				self.set_flags(n, z, false, c);
+				self.set_flags(n, z, false, c, c);
 				cycles = match size {
 					Size::Byte | Size::Word => 6,
 					Size::Long => 8,
@@ -3733,7 +3700,7 @@ impl CPU {
 		// Check for pending interrupts
 		if let Some(&(level, vector)) = self.pending_interrupts.first() {
 			let current_ipl = (self.sr >> 8) & 0x7;
-			if level > current_ipl || (level == 7 && self.interrupt_nest_level < 7) {
+			if u16::from(level) > current_ipl || (level == 7 && self.interrupt_nest_level < 7) {
 				let cycles = self.process_interrupt(level, vector);
 				self.cycle_count += cycles as u64;
 				return cycles;
@@ -3750,8 +3717,9 @@ impl CPU {
     /// Load a program into memory at a given address
     pub fn load_program(&mut self, address: u32, program: &[u8]) {
         for (i, &byte) in program.iter().enumerate() {
-            self.memory.write_byte(address + i as u32, byte);
+            self.cpu_write_byte(address + i as u32, byte);
         }
         self.pc = address;
+		self.prefetch();
     }
 }
