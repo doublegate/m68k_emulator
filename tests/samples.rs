@@ -1,9 +1,10 @@
 // tests/samples.rs
 use m68k_emulator::m68k_cpu::CPU;
+use m68k_emulator::memory::Memory;
 
 #[test]
 fn test_loop_program() {
-    let mut cpu = CPU::new(1024);
+    let mut cpu = CPU::new(Memory::new(vec![0; 0x400000]));
     let program = [
         0x70, 0x05,       // MOVEQ #5, D0
         0x53, 0x40,       // SUBQ.W #1, D0
@@ -16,17 +17,18 @@ fn test_loop_program() {
     }
     assert_eq!(cpu.d[0], 0);
     assert_eq!(cpu.pc, 0x100A);
+    // The cycle count assertion here is approximate – adjust as needed.
     assert_eq!(cpu.cycle_count, 4 + 5 * (8 + 12) + 4); // MOVEQ + 5*(SUBQ+BNE) + NOP
 }
 
 #[test]
 fn test_interrupt_sample() {
-    let mut cpu = CPU::new(1024);
+    let mut cpu = CPU::new(Memory::new(vec![0; 0x400000]));
     let program = [
         0x4E, 0x71,       // NOP
         0x4E, 0x72, 0x27, 0x00, // STOP #0x2700
     ];
-    cpu.memory.write_long(0x64, 0x2000); // Level 1 vector
+    cpu.memory.write_long(0x64, 0x2000).expect("Failed to write vector 25"); // Level 1 vector
     let interrupt_handler = [
         0x4E, 0x75,       // RTS
     ];

@@ -1,8 +1,100 @@
+Project Path: m68k_emulator
+
+Source Tree:
+
+```
+m68k_emulator
+├── Cargo.toml
+├── CHANGELOG.md
+├── CONTRIBUTING.md
+├── docs
+├── LICENSE
+├── m68k_emulator.exe
+├── OpenAI_LLM.txt
+├── README.md
+├── src
+│   ├── emulator.rs
+│   ├── lib.rs
+│   ├── m68k_cpu.rs
+│   ├── main.rs
+│   └── memory.rs
+└── tests
+    ├── cpu_tests.rs
+    └── samples.rs
+
+```
+
+`\\?\C:\Users\parobek\GitHub\m68k_emulator\Cargo.toml`:
+
+```toml
+[package]
+name = "m68k_emulator"
+version = "0.2.0"
+edition = "2021"
+
+[dependencies]
+
+[lib]
+name = "m68k_emulator"
+path = "src/lib.rs"
+
+```
+
+`\\?\C:\Users\parobek\GitHub\m68k_emulator\src\emulator.rs`:
+
+```rs
+// emulator.rs
+use crate::m68k_cpu::CPU;
+use crate::memory::Memory;
+
+pub struct Emulator {
+    cpu: CPU,
+    // Add Z80, VDP, sound, I/O later
+}
+
+impl Emulator {
+    pub fn new(rom_data: Vec<u8>) -> Emulator {
+		let memory = Memory::new(rom_data);
+		let mut cpu = CPU::new(memory);
+		cpu.pc = cpu.memory.read_long(4).unwrap_or(0); // Handle errors as needed
+		cpu.a[7] = cpu.memory.read_long(0).unwrap_or(0);
+		cpu.prefetch();
+		Emulator { cpu }
+	}
+
+    pub fn step(&mut self) -> u32 {
+        self.cpu.step()
+    }
+
+    pub fn run_frame(&mut self) {
+        let cycles_per_frame = 7_670_000 / 60; // ~60 FPS at 7.67 MHz
+        let mut cycles = 0;
+        while cycles < cycles_per_frame {
+            cycles += self.step();
+        }
+    }
+}
+
+```
+
+`\\?\C:\Users\parobek\GitHub\m68k_emulator\src\lib.rs`:
+
+```rs
+// src/lib.rs
+pub mod m68k_cpu;
+pub mod memory;
+pub mod emulator;
+
+```
+
+`\\?\C:\Users\parobek\GitHub\m68k_emulator\src\m68k_cpu.rs`:
+
+```rs
 // src/m68k_cpu.rs
 use crate::memory::Memory;
 use crate::memory::Exception;
 
-#[derive(Debug, Clone, Copy, PartialEq)] // Add PartialEq
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Size {
     Byte,
     Word,
@@ -10,7 +102,7 @@ pub enum Size {
 }
 
 impl Size {
-    fn bits(&self) -> u32 {
+    pub fn bits(&self) -> u32 {
         match self {
             Size::Byte => 8,
             Size::Word => 16,
@@ -18,7 +110,7 @@ impl Size {
         }
     }
 
-    fn mask(&self) -> u32 {
+    pub fn mask(&self) -> u32 {
         match self {
             Size::Byte => 0xFF,
             Size::Word => 0xFFFF,
@@ -43,7 +135,7 @@ pub enum Operand {
     Immediate(u32),
 }
 
-#[derive(Debug, PartialEq)] // Add PartialEq
+#[derive(Debug, PartialEq)]
 pub enum Operation {
     Nop,
     Rts,
@@ -142,7 +234,7 @@ pub enum Operation {
     AndiCcr,
     OriCcr,
     EoriCcr,
-    LslMem,
+    LslMem, // duplicate? (check if needed)
     Asr,
 }
 
@@ -160,14 +252,14 @@ pub struct CPU {
     pub pc: u32,
     pub sr: u16,
     pub memory: Memory,
-    cycle_count: u64,
-    pending_interrupts: Vec<(u8, Option<u8>)>, // Use Vec with capacity
-    interrupt_ack: Option<u8>,
-    interrupt_nest_level: u8,
-    bus_state: BusState,
-    halted: bool,
-    prefetch_queue: [u16; 2],
-    exception_in_progress: bool, // Flag to prevent recursive exceptions
+    pub cycle_count: u64,
+    pub pending_interrupts: Vec<(u8, Option<u8>)>,
+    pub interrupt_ack: Option<u8>,
+    pub interrupt_nest_level: u8,
+    pub bus_state: BusState,
+    pub halted: bool,
+    pub prefetch_queue: [u16; 2],
+    pub exception_in_progress: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -183,17 +275,17 @@ impl CPU {
         CPU {
             d: [0; 8],
             a: [0; 8],
-            pc: 0, // PC is initialized later
+            pc: 0,
             sr: 0x2700,
             memory,
             cycle_count: 0,
-            pending_interrupts: Vec::with_capacity(8), // Pre-allocate
+            pending_interrupts: Vec::with_capacity(8),
             interrupt_ack: None,
             interrupt_nest_level: 0,
             bus_state: BusState::Idle,
             halted: false,
             prefetch_queue: [0; 2],
-            exception_in_progress: false, // Initialize exception flag
+            exception_in_progress: false,
         }
     }
 
@@ -201,12 +293,12 @@ impl CPU {
         match self.memory.read_byte(address) {
             Ok(value) => value,
             Err(Exception::AddressError) => {
-                if !self.exception_in_progress { // Avoid recursion
+                if !self.exception_in_progress {
                     self.exception_in_progress = true;
                     self.trigger_exception(3);
                     self.exception_in_progress = false;
                 }
-                0 // Return a safe value, don't propagate error
+                0
             }
         }
     }
@@ -220,7 +312,7 @@ impl CPU {
                     self.trigger_exception(3);
                     self.exception_in_progress = false;
                 }
-                0 // Avoid propagating AddressError
+                0
             }
         }
     }
@@ -234,26 +326,8 @@ impl CPU {
                     self.trigger_exception(3);
                     self.exception_in_progress = false;
                 }
-                0 // Avoid propagating AddressError
+                0
             }
-        }
-    }
-
-    fn cpu_write_byte(&mut self, address: u32, value: u8) {
-        if let Err(Exception::AddressError) = self.memory.write_byte(address, value) {
-            self.trigger_exception(3);
-        }
-    }
-
-    fn cpu_write_word(&mut self, address: u32, value: u16) {
-        if let Err(Exception::AddressError) = self.memory.write_word(address, value) {
-            self.trigger_exception(3);
-        }
-    }
-
-    fn cpu_write_long(&mut self, address: u32, value: u32) {
-        if let Err(Exception::AddressError) = self.memory.write_long(address, value) {
-            self.trigger_exception(3);
         }
     }
 
@@ -279,21 +353,11 @@ impl CPU {
 
     fn set_flags(&mut self, n: bool, z: bool, v: bool, c: bool, x: bool) {
         let mut sr = self.sr & 0xFFF0;
-        if n {
-            sr |= 0x8;
-        }
-        if z {
-            sr |= 0x4;
-        }
-        if v {
-            sr |= 0x2;
-        }
-        if c {
-            sr |= 0x1;
-        }
-        if x {
-            sr |= 0x10;
-        }
+        if n { sr |= 0x8; }
+        if z { sr |= 0x4; }
+        if v { sr |= 0x2; }
+        if c { sr |= 0x1; }
+        if x { sr |= 0x10; }
         self.sr = sr;
     }
 
@@ -301,7 +365,7 @@ impl CPU {
         match operand {
             Operand::DataRegister(_) => 0,
             Operand::AddressRegister(_) => 0,
-            Operand::Indirect(_reg) => match size {
+            Operand::Indirect(_) => match size {
                 Size::Byte | Size::Word => 4,
                 Size::Long => 8,
             },
@@ -362,14 +426,8 @@ impl CPU {
     }
 
     pub fn request_interrupt(&mut self, level: u8, vector: Option<u8>) {
-        if level > 7 || level == 0 {
-            return;
-        }
-        if let Some(v) = vector {
-            if v < 2 {
-                return;
-            }
-        }
+        if level > 7 || level == 0 { return; }
+        if let Some(v) = vector { if v < 2 { return; } }
         if !self.pending_interrupts.iter().any(|&(l, v)| l == level && v == vector) {
             self.pending_interrupts.push((level, vector));
             self.pending_interrupts.sort_by(|a, b| b.0.cmp(&a.0));
@@ -396,13 +454,12 @@ impl CPU {
         self.sr |= 0x2000;
         self.sr = (self.sr & 0xF8FF) | ((level as u16) << 8);
         self.interrupt_nest_level += 1;
-        self.a[7] -= 2;
-        self.cpu_write_word(self.a[7], self.sr);
-        self.a[7] -= 4;
-        self.cpu_write_long(self.a[7], self.pc);
+        self.a[7] = self.a[7].wrapping_sub(2);
+        self.memory.write_word(self.a[7], self.sr).expect("Interrupt: failed to write SR");
+        self.a[7] = self.a[7].wrapping_sub(4);
+        self.memory.write_long(self.a[7], self.pc).expect("Interrupt: failed to write PC");
         cycles += 10;
         self.pc = self.cpu_read_long(vec_addr * 4);
-        // Remove prefetch here, called in step()
         cycles += 4;
         self.bus_state = BusState::Idle;
         self.pending_interrupts.retain(|&(l, _)| l != level);
@@ -410,37 +467,15 @@ impl CPU {
     }
 
     pub fn trigger_exception(&mut self, vector: u32) -> u32 {
-        // If an exception is already in progress, halt to avoid recursion.
-        if self.exception_in_progress {
-             self.halted = true;
-             return 0;
-        }
-        self.exception_in_progress = true;
-        
-        // Set supervisor bit.
         self.sr |= 0x2000;
-        
-        // Push SR and PC onto the stack.
         self.a[7] = self.a[7].wrapping_sub(2);
-        self.cpu_write_word(self.a[7], self.sr);
+        self.memory.write_word(self.a[7], self.sr).expect("Exception: failed to write SR");
         self.a[7] = self.a[7].wrapping_sub(4);
-        self.cpu_write_long(self.a[7], self.pc);
-        
-        // Load new PC from exception vector table.
+        self.memory.write_long(self.a[7], self.pc).expect("Exception: failed to write PC");
         let new_pc = self.cpu_read_long(vector * 4);
         self.pc = new_pc;
-        
-        self.exception_in_progress = false;
-        
-        // If the new PC is 0 (or invalid), halt the CPU to prevent endless exception loops.
-        if new_pc == 0 {
-             self.halted = true;
-        }
+        if new_pc == 0 { self.halted = true; }
         34
-    }
-
-    pub fn get_interrupt_ack(&self) -> (Option<u8>, BusState) {
-        (self.interrupt_ack, self.bus_state)
     }
 
     fn decode_ea(&mut self, mode: u8, reg: u8, size: Size) -> Operand {
@@ -458,11 +493,7 @@ impl CPU {
                 let ext = self.fetch_word();
                 let disp = (ext as i8) as i8;
                 let index_reg = (ext >> 12) & 0x7;
-                let index_size = if (ext & 0x800) != 0 {
-                    Size::Long
-                } else {
-                    Size::Word
-                };
+                let index_size = if (ext & 0x800) != 0 { Size::Long } else { Size::Word };
                 Operand::Indexed(reg, disp, index_reg as u8, index_size)
             }
             7 => match reg {
@@ -476,11 +507,7 @@ impl CPU {
                     let ext = self.fetch_word();
                     let disp = (ext as i8) as i8;
                     let index_reg = (ext >> 12) & 0x7;
-                    let index_size = if (ext & 0x800) != 0 {
-                        Size::Long
-                    } else {
-                        Size::Word
-                    };
+                    let index_size = if (ext & 0x800) != 0 { Size::Long } else { Size::Word };
                     Operand::PCIndexed(disp, index_reg as u8, index_size)
                 }
                 4 => {
@@ -588,22 +615,44 @@ impl CPU {
 
     fn set_operand_value(&mut self, size: Size, operand: &Operand, value: u32) {
         match operand {
-            Operand::DataRegister(reg) => self.d[*reg as usize] = value & size.mask(),
-            Operand::AddressRegister(reg) => self.a[*reg as usize] = value,
+            Operand::DataRegister(reg) => {
+                self.d[*reg as usize] = value & size.mask();
+            }
+            Operand::AddressRegister(reg) => {
+                self.a[*reg as usize] = value;
+            }
             Operand::Indirect(reg) => {
                 let addr = self.a[*reg as usize];
                 match size {
-                    Size::Byte => self.cpu_write_byte(addr, value as u8),
-                    Size::Word => self.cpu_write_word(addr, value as u16),
-                    Size::Long => self.cpu_write_long(addr, value),
+                    Size::Byte => {
+                        self.memory.write_byte(addr, value as u8)
+                            .expect("Memory write error in MOVE (Indirect Byte)")
+                    }
+                    Size::Word => {
+                        self.memory.write_word(addr, value as u16)
+                            .expect("Memory write error in MOVE (Indirect Word)")
+                    }
+                    Size::Long => {
+                        self.memory.write_long(addr, value)
+                            .expect("Memory write error in MOVE (Indirect Long)")
+                    }
                 }
             }
             Operand::PostInc(reg) => {
                 let addr = self.a[*reg as usize];
                 match size {
-                    Size::Byte => self.cpu_write_byte(addr, value as u8),
-                    Size::Word => self.cpu_write_word(addr, value as u16),
-                    Size::Long => self.cpu_write_long(addr, value),
+                    Size::Byte => {
+                        self.memory.write_byte(addr, value as u8)
+                            .expect("Memory write error in MOVE (PostInc Byte)")
+                    }
+                    Size::Word => {
+                        self.memory.write_word(addr, value as u16)
+                            .expect("Memory write error in MOVE (PostInc Word)")
+                    }
+                    Size::Long => {
+                        self.memory.write_long(addr, value)
+                            .expect("Memory write error in MOVE (PostInc Long)")
+                    }
                 }
                 self.a[*reg as usize] += size.bits() / 8;
             }
@@ -611,17 +660,35 @@ impl CPU {
                 self.a[*reg as usize] -= size.bits() / 8;
                 let addr = self.a[*reg as usize];
                 match size {
-                    Size::Byte => self.cpu_write_byte(addr, value as u8),
-                    Size::Word => self.cpu_write_word(addr, value as u16),
-                    Size::Long => self.cpu_write_long(addr, value),
+                    Size::Byte => {
+                        self.memory.write_byte(addr, value as u8)
+                            .expect("Memory write error in MOVE (PreDec Byte)")
+                    }
+                    Size::Word => {
+                        self.memory.write_word(addr, value as u16)
+                            .expect("Memory write error in MOVE (PreDec Word)")
+                    }
+                    Size::Long => {
+                        self.memory.write_long(addr, value)
+                            .expect("Memory write error in MOVE (PreDec Long)")
+                    }
                 }
             }
             Operand::Displacement(reg, disp) => {
                 let addr = self.a[*reg as usize].wrapping_add(*disp as u32);
                 match size {
-                    Size::Byte => self.cpu_write_byte(addr, value as u8),
-                    Size::Word => self.cpu_write_word(addr, value as u16),
-                    Size::Long => self.cpu_write_long(addr, value),
+                    Size::Byte => {
+                        self.memory.write_byte(addr, value as u8)
+                            .expect("Memory write error in MOVE (Displacement Byte)")
+                    }
+                    Size::Word => {
+                        self.memory.write_word(addr, value as u16)
+                            .expect("Memory write error in MOVE (Displacement Word)")
+                    }
+                    Size::Long => {
+                        self.memory.write_long(addr, value)
+                            .expect("Memory write error in MOVE (Displacement Long)")
+                    }
                 }
             }
             Operand::Indexed(reg, disp, idx_reg, idx_size) => {
@@ -633,21 +700,52 @@ impl CPU {
                 };
                 let addr = base.wrapping_add(*disp as i32 as u32).wrapping_add(index as u32);
                 match size {
-                    Size::Byte => self.cpu_write_byte(addr, value as u8),
-                    Size::Word => self.cpu_write_word(addr, value as u16),
-                    Size::Long => self.cpu_write_long(addr, value),
+                    Size::Byte => {
+                        self.memory.write_byte(addr, value as u8)
+                            .expect("Memory write error in MOVE (Indexed Byte)")
+                    }
+                    Size::Word => {
+                        self.memory.write_word(addr, value as u16)
+                            .expect("Memory write error in MOVE (Indexed Word)")
+                    }
+                    Size::Long => {
+                        self.memory.write_long(addr, value)
+                            .expect("Memory write error in MOVE (Indexed Long)")
+                    }
                 }
             }
-            Operand::AbsoluteShort(addr) => match size {
-                Size::Byte => self.cpu_write_byte(*addr, value as u8),
-                Size::Word => self.cpu_write_word(*addr, value as u16),
-                Size::Long => self.cpu_write_long(*addr, value),
-            },
-            Operand::AbsoluteLong(addr) => match size {
-                Size::Byte => self.cpu_write_byte(*addr, value as u8),
-                Size::Word => self.cpu_write_word(*addr, value as u16),
-                Size::Long => self.cpu_write_long(*addr, value),
-            },
+            Operand::AbsoluteShort(addr) => {
+                match size {
+                    Size::Byte => {
+                        self.memory.write_byte(*addr, value as u8)
+                            .expect("Memory write error in MOVE (AbsoluteShort Byte)")
+                    }
+                    Size::Word => {
+                        self.memory.write_word(*addr, value as u16)
+                            .expect("Memory write error in MOVE (AbsoluteShort Word)")
+                    }
+                    Size::Long => {
+                        self.memory.write_long(*addr, value)
+                            .expect("Memory write error in MOVE (AbsoluteShort Long)")
+                    }
+                }
+            }
+            Operand::AbsoluteLong(addr) => {
+                match size {
+                    Size::Byte => {
+                        self.memory.write_byte(*addr, value as u8)
+                            .expect("Memory write error in MOVE (AbsoluteLong Byte)")
+                    }
+                    Size::Word => {
+                        self.memory.write_word(*addr, value as u16)
+                            .expect("Memory write error in MOVE (AbsoluteLong Word)")
+                    }
+                    Size::Long => {
+                        self.memory.write_long(*addr, value)
+                            .expect("Memory write error in MOVE (AbsoluteLong Long)")
+                    }
+                }
+            }
             _ => panic!("Cannot write to operand: {:?}", operand),
         }
     }
@@ -655,7 +753,7 @@ impl CPU {
     fn decode(&mut self) -> Instruction {
         let opcode = self.fetch_word();
 
-        // Handle RTS first
+        // Handle RTS
         if opcode == 0x4E75 {
             return Instruction {
                 operation: Operation::Rts,
@@ -681,7 +779,7 @@ impl CPU {
                 0x4E73 => Operation::Rte,
                 0x4E70 => Operation::Reset,
                 0x4E76 => Operation::Trapv,
-                _ => Operation::Nop, // Should not happen
+                _ => Operation::Nop,
             };
             return Instruction {
                 operation,
@@ -714,14 +812,13 @@ impl CPU {
             };
         }
 
-        // Branch instructions (most common first)
+        // Branch instructions
         if (opcode & 0xFF00) == 0x6000 {
             let disp = if (opcode & 0x00FF) == 0 {
                 self.fetch_word() as i16 as i32
             } else {
                 (opcode & 0x00FF) as i8 as i32
             };
-
             let operation = match opcode & 0x0F00 {
                 0x0000 => Operation::Bra,
                 0x0400 => Operation::Bhi,
@@ -738,7 +835,7 @@ impl CPU {
                 0x1A00 => Operation::Blt,
                 0x1C00 => Operation::Bgt,
                 0x1E00 => Operation::Ble,
-                _ => Operation::Nop, // Should not happen
+                _ => Operation::Nop,
             };
             return Instruction {
                 operation,
@@ -770,6 +867,22 @@ impl CPU {
             };
         }
 
+        // MOVEM instructions
+        if (opcode & 0xF138) == 0x4880 {
+            // This is a simplified MOVEM decoder.
+            let size = if (opcode & 0x0040) == 0 { Size::Word } else { Size::Long };
+            let reglist = self.fetch_word();
+            let src_or_dst = (opcode >> 3) & 0x7;
+            // We'll assume a simple addressing mode here for demonstration.
+            let ea = self.decode_ea(src_or_dst, (opcode & 0x7) as u8, size);
+            return Instruction {
+                operation: Operation::Movem,
+                size: Some(size),
+                src: Some(Operand::Immediate(reglist as u32)),
+                dst: Some(ea),
+            };
+        }
+        
         // ADD, SUB instructions
         if (opcode & 0xD000) == 0xD000 {
             let reg = ((opcode >> 9) & 0x7) as u8;
@@ -1102,7 +1215,7 @@ impl CPU {
             };
         }
 
-        //Default NOP or exception
+        // Default: trigger exception and return a NOP.
         self.trigger_exception(4);
         Instruction {
             operation: Operation::Nop,
@@ -1134,6 +1247,70 @@ impl CPU {
                     Size::Byte | Size::Word => 4,
                     Size::Long => 8,
                 } + self.ea_cycles(&src, size) + self.ea_cycles(&dst, size);
+            }
+            Operation::Movem => {
+                let size = instr.size.unwrap();
+                let src = instr.src.unwrap();
+                let dst = instr.dst.unwrap();
+                let reglist = self.get_operand_value(Size::Long, &src) as u16;
+                let mut addr = match dst {
+                    Operand::Indirect(reg) => self.a[reg as usize],
+                    Operand::Displacement(reg, disp) => self.a[reg as usize].wrapping_add(disp as u32),
+                    _ => match src {
+                        Operand::Indirect(reg) => self.a[reg as usize],
+                        Operand::Displacement(reg, disp) => self.a[reg as usize].wrapping_add(disp as u32),
+                        _ => panic!("Unsupported MOVEM addressing mode"),
+                    },
+                };
+                cycles = 12 + self.ea_cycles(&src, size);
+                let mut bit = 0;
+                let regs = reglist.count_ones();
+                if let Operand::Immediate(_) = src {
+                    for i in 0..16 {
+                        if (reglist & (1 << bit)) != 0 {
+                            let value = if i < 8 {
+                                self.d[i]
+                            } else {
+                                self.a[i - 8]
+                            };
+                            if size == Size::Word {
+                                self.memory.write_word(addr, value as u16)
+                                    .expect("MOVEM: write_word error");
+                                addr += 2;
+                                cycles += 4;
+                            } else {
+                                self.memory.write_long(addr, value)
+                                    .expect("MOVEM: write_long error");
+                                addr += 4;
+                                cycles += 8;
+                            }
+                        }
+                        bit += 1;
+                    }
+                } else {
+                    for i in 0..16 {
+                        if (reglist & (1 << bit)) != 0 {
+                            let value = if size == Size::Word {
+                                let val = self.cpu_read_word(addr) as u32;
+                                addr += 2;
+                                cycles += 4;
+                                val
+                            } else {
+                                let val = self.cpu_read_long(addr);
+                                addr += 4;
+                                cycles += 8;
+                                val
+                            };
+                            if i < 8 {
+                                self.d[i] = value;
+                            } else {
+                                self.a[i - 8] = value;
+                            }
+                        }
+                        bit += 1;
+                    }
+                }
+                cycles = 12 + (if size == Size::Word { 4 } else { 8 } * regs);
             }
             Operation::Add => {
                 let size = instr.size.unwrap();
@@ -2298,73 +2475,7 @@ impl CPU {
                 }
                 cycles = 6;
             }
-            Operation::Movem => {
-                let size = instr.size.unwrap();
-                let src = instr.src.unwrap();
-                let dst = instr.dst.unwrap();
-                let reglist = self.get_operand_value(Size::Long, &src) as u16;
-                let mut addr = match dst {
-                    Operand::Indirect(reg) => self.a[reg as usize],
-                    Operand::Displacement(reg, disp) => self.a[reg as usize].wrapping_add(disp as u32),
-                    _ => match src {
-                        Operand::Indirect(reg) => self.a[reg as usize],
-                        Operand::Displacement(reg, disp) => self.a[reg as usize].wrapping_add(disp as u32),
-                        _ => panic!("Unsupported MOVEM addressing mode"),
-                    },
-                };
-                cycles = 12 + self.ea_cycles(&src, size);
-                let mut bit = 0;
-                let regs = reglist.count_ones();
-                if let Operand::Immediate(_) = src {
-                    for i in 0..16 {
-                        if (reglist & (1 << bit)) != 0 {
-                            let value = if i < 8 {
-                                self.d[i]
-                            } else {
-                                self.a[i - 8]
-                            };
-                            if size == Size::Word {
-                                self.cpu_write_word(addr, value as u16);
-                                addr += 2;
-                                cycles += 4;
-                            } else {
-                                self.cpu_write_long(addr, value);
-                                addr += 4;
-                                cycles += 8;
-                            }
-                        }
-                        bit += 1;
-                    }
-                } else {
-                    for i in 0..16 {
-                        if (reglist & (1 << bit)) != 0 {
-                            let value = if size == Size::Word {
-                                let val = self.cpu_read_word(addr) as u32;
-                                addr += 2;
-                                cycles += 4;
-                                val
-                            } else {
-                                let val = self.cpu_read_long(addr);
-                                addr += 4;
-                                cycles += 8;
-                                val
-                            };
-                            if i < 8 {
-                                self.d[i] = value;
-                            } else {
-                                self.a[i - 8] = value;
-                            }
-                        }
-                        bit += 1;
-                    }
-                }
-                cycles = 12 + (if size == Size::Word {
-                    4
-                } else {
-                    8
-                } * regs);
-            }
-            Operation::AslMem => {
+                        Operation::AslMem => {
                 let size = instr.size.unwrap();
                 let dst = instr.dst.unwrap();
                 let dst_val = self.get_operand_value(size, &dst);
@@ -2929,6 +3040,7 @@ impl CPU {
         }
         cycles
     }
+
     pub fn step(&mut self) -> u32 {
         if self.halted && self.pending_interrupts.is_empty() {
             return 0;
@@ -2945,21 +3057,328 @@ impl CPU {
         let cycles = self.execute(instr);
         self.cycle_count += cycles as u64;
         self.interrupt_ack = None;
-        self.prefetch(); // Prefetch after execution.
+        self.prefetch();
         cycles
     }
-    // Modified load_program: if the destination is in ROM, use load_rom_data
+
     pub fn load_program(&mut self, address: u32, program: &[u8]) {
         if address < 0x400000 {
-            // Load directly into ROM data (for initialization)
             self.memory.load_rom_data(address, program)
                 .expect("Failed to load program into ROM");
         } else {
             for (i, &byte) in program.iter().enumerate() {
-                self.cpu_write_byte(address + i as u32, byte);
+                self.memory.write_byte(address + i as u32, byte)
+                    .expect("Failed to write program to memory");
             }
         }
         self.pc = address;
         self.prefetch();
     }
 }
+
+```
+
+`\\?\C:\Users\parobek\GitHub\m68k_emulator\src\main.rs`:
+
+```rs
+// src/main.rs
+use m68k_emulator::m68k_cpu::CPU;
+use m68k_emulator::memory::Memory;
+
+fn main() {
+    // Create a memory instance with 16 MB.
+    // The ROM region is assumed to be the lower 4 MB (0x000000 to 0x3FFFFF),
+    // and the RAM region is 0xFF0000 to 0xFFFFFF.
+    let mut memory = Memory::new(vec![0; 16 * 1024 * 1024]);
+    let mut cpu = CPU::new(memory);
+
+    // Example program:
+    //   0x4E71: NOP
+    //   0x1080: MOVE.B D0, (A0)
+    //   0x4E75: RTS
+    let program = [
+        0x4E, 0x71, // NOP
+        0x10, 0x80, // MOVE.B D0, (A0)
+        0x4E, 0x75, // RTS
+    ];
+
+    // Load the program into ROM at address 0x1000 (below 0x400000)
+    cpu.load_program(0x1000, &program);
+
+    // Set registers:
+    cpu.d[0] = 0x42;       // D0 = 0x42 (source for MOVE.B)
+    cpu.a[0] = 0xFF0000;   // A0 points to a valid RAM address
+
+    // (For this test, we are not setting up any interrupts.)
+
+    println!("Initial PC: {:06X}", cpu.pc);
+
+    // Execute NOP (first instruction)
+    let cycles = cpu.step();
+    println!("After NOP: PC={:06X}, Cycles={}", cpu.pc, cycles);
+
+    // Execute MOVE.B D0, (A0)
+    let cycles = cpu.step();
+    println!("After MOVE.B: PC={:06X}, Cycles={}", cpu.pc, cycles);
+
+    // Read from the RAM address pointed to by A0.
+    // Since A0 is 0xFF0000, and writes to RAM use (address & 0xFFFF) as the index,
+    // the written value is stored in ram[0].
+    let memory_value = cpu.memory.read_byte(cpu.a[0]).unwrap_or(0);
+    println!("Memory[A0]={:02X}", memory_value);
+
+    // Execute RTS (return from subroutine)
+    let cycles = cpu.step();
+    println!("After RTS: PC={:06X}, Cycles={}", cpu.pc, cycles);
+}
+
+```
+
+`\\?\C:\Users\parobek\GitHub\m68k_emulator\src\memory.rs`:
+
+```rs
+// src/memory.rs
+#[derive(Debug)]
+pub enum Exception {
+    AddressError,
+}
+
+#[derive(Clone)]
+pub struct Memory {
+    pub rom: Vec<u8>,       // ROM region: loaded from an external source through rom_data.
+    pub ram: Box<[u8; 0x10000]>, // RAM region: fixed-size array of 64KB; Box to allocate on heap.
+    // Future expansion: regions for Z80, VDP, I/O, etc.
+}
+
+impl Memory {
+    /// Creates a new Memory instance.
+    /// The provided rom_data should have a length that covers the ROM region (ideally 0x400000 bytes).
+    pub fn new(rom_data: Vec<u8>) -> Self {
+        Memory {
+            rom: rom_data,
+            ram: Box::new([0; 0x10000]),
+        }
+    }
+    
+    /// Loads data directly into the ROM region.
+    /// This is intended for initialization (e.g. loading a program) even though ROM is read-only during emulation.
+    pub fn load_rom_data(&mut self, address: u32, data: &[u8]) -> Result<(), Exception> {
+        if address + data.len() as u32 > self.rom.len() as u32 {
+            return Err(Exception::AddressError);
+        }
+        self.rom[address as usize .. (address as usize + data.len())].copy_from_slice(data);
+        Ok(())
+    }
+    
+    /// Reads a byte from the given address.
+    pub fn read_byte(&self, addr: u32) -> Result<u8, Exception> {
+        match addr {
+            // Access ROM region: valid addresses from 0x000000 to 0x3FFFFF.
+            0x000000..=0x3FFFFF => {
+                if (addr as usize) < self.rom.len() {
+                    Ok(self.rom[addr as usize])
+                } else {
+                    Err(Exception::AddressError)
+                }
+            },
+            // Access RAM region: valid addresses from 0xFF0000 to 0xFFFFFF.
+            0xFF0000..=0xFFFFFF => Ok(self.ram[(addr & 0xFFFF) as usize]),
+            _ => Err(Exception::AddressError),
+        }
+    }
+
+    /// Writes a byte to the given address.
+    pub fn write_byte(&mut self, addr: u32, value: u8) -> Result<(), Exception> {
+        match addr {
+            // Only the RAM region is writable.
+            0xFF0000..=0xFFFFFF => {
+                self.ram[(addr & 0xFFFF) as usize] = value;
+                Ok(())
+            }
+            _ => Err(Exception::AddressError),
+        }
+    }
+
+    /// Reads a 16-bit word from the specified address.
+    pub fn read_word(&self, addr: u32) -> Result<u16, Exception> {
+        if addr & 1 != 0 {
+            Err(Exception::AddressError)
+        } else {
+            let high = self.read_byte(addr)? as u16;
+            let low = self.read_byte(addr + 1)? as u16;
+            Ok((high << 8) | low)
+        }
+    }
+
+    /// Writes a 16-bit word to the specified address.
+    pub fn write_word(&mut self, addr: u32, value: u16) -> Result<(), Exception> {
+        if addr & 1 != 0 {
+            Err(Exception::AddressError)
+        } else {
+            self.write_byte(addr, (value >> 8) as u8)?;
+            self.write_byte(addr + 1, value as u8)?;
+            Ok(())
+        }
+    }
+
+    /// Reads a 32-bit long word from the specified address.
+    pub fn read_long(&self, addr: u32) -> Result<u32, Exception> {
+        if addr & 1 != 0 {
+            return Err(Exception::AddressError);
+        }
+        
+        match addr {
+            0x000000..=0x3FFFFF if (addr + 3) < self.rom.len() as u32 => {
+                let i = addr as usize;
+                Ok(((self.rom[i] as u32) << 24) | 
+                   ((self.rom[i+1] as u32) << 16) | 
+                   ((self.rom[i+2] as u32) << 8) | 
+                   (self.rom[i+3] as u32))
+            },
+            0xFF0000..=0xFFFFFF => {
+                let i = (addr & 0xFFFF) as usize;
+                Ok(((self.ram[i] as u32) << 24) | 
+                   ((self.ram[i+1] as u32) << 16) | 
+                   ((self.ram[i+2] as u32) << 8) | 
+                   (self.ram[i+3] as u32))
+            },
+            _ => Err(Exception::AddressError),
+        }
+    }
+
+    /// Writes a 32-bit long word to the specified address.
+    pub fn write_long(&mut self, addr: u32, value: u32) -> Result<(), Exception> {
+        if addr & 1 != 0 {
+            Err(Exception::AddressError)
+        } else {
+            self.write_word(addr, (value >> 16) as u16)?;
+            self.write_word(addr + 2, value as u16)?;
+            Ok(())
+        }
+    }
+}
+
+```
+
+`\\?\C:\Users\parobek\GitHub\m68k_emulator\tests\cpu_tests.rs`:
+
+```rs
+// tests/cpu_tests.rs
+use m68k_emulator::m68k_cpu::{CPU, Instruction, Operation, Operand, Size};
+use m68k_emulator::memory::Memory;
+
+#[test]
+fn test_nop() {
+    // Create memory with a 4MB ROM
+    let mut cpu = CPU::new(Memory::new(vec![0; 0x400000]));
+    cpu.load_program(0x1000, &[0x4E, 0x71]); // NOP
+    let cycles = cpu.step();
+    assert_eq!(cpu.pc, 0x1004); // PC advances 4 (prefetch)
+    assert_eq!(cycles, 4);
+}
+
+#[test]
+fn test_move() {
+    let mut cpu = CPU::new(Memory::new(vec![0; 0x400000]));
+    cpu.d[0] = 0x42;
+    cpu.a[1] = 0x2000;
+    cpu.load_program(0x1000, &[0x12, 0x40]); // MOVE.B D0, (A1)
+    let cycles = cpu.step();
+    assert_eq!(cpu.pc, 0x1004);
+    assert_eq!(cpu.memory.read_byte(0x2000).expect("Memory read failed"), 0x42);
+    assert_eq!(cycles, 8); // 4 base + 4 EA
+    assert_eq!(cpu.sr & 0xF, 0); // N=0, Z=0
+}
+
+#[test]
+fn test_add() {
+    let mut cpu = CPU::new(Memory::new(vec![0; 0x400000]));
+    cpu.d[0] = 0x5;
+    cpu.d[1] = 0x3;
+    cpu.load_program(0x1000, &[0xD2, 0x00]); // ADD.W D0, D1
+    let cycles = cpu.step();
+    assert_eq!(cpu.d[1], 0x8);
+    assert_eq!(cycles, 4);
+    assert_eq!(cpu.sr & 0xF, 0); // No flags set
+}
+
+#[test]
+fn test_divu_zero_divide() {
+    let mut cpu = CPU::new(Memory::new(vec![0; 0x400000]));
+    cpu.d[0] = 0x10;
+    cpu.d[1] = 0;
+    cpu.memory.write_long(0x14, 0x3000).expect("Failed to write vector 5"); // Zero Divide vector
+    cpu.load_program(0x1000, &[0x80, 0xC1]); // DIVU.W D1, D0
+    let cycles = cpu.step();
+    assert_eq!(cpu.pc, 0x3000);
+    assert_eq!(cycles, 34);
+}
+
+#[test]
+fn test_stop_and_interrupt() {
+    let mut cpu = CPU::new(Memory::new(vec![0; 0x400000]));
+    cpu.memory.write_long(0x64, 0x3000).expect("Failed to write vector 25"); // Level 1 vector
+    cpu.load_program(0x1000, &[0x4E, 0x72, 0x27, 0x00]); // STOP #0x2700
+    let cycles = cpu.step();
+    assert!(cpu.halted);
+    assert_eq!(cycles, 4);
+    let cycles = cpu.step();
+    assert_eq!(cycles, 0); // Halted, no interrupt
+    cpu.request_interrupt(1, None);
+    let cycles = cpu.step();
+    assert!(!cpu.halted);
+    assert_eq!(cpu.pc, 0x3000);
+    assert_eq!(cycles, 34);
+}
+
+```
+
+`\\?\C:\Users\parobek\GitHub\m68k_emulator\tests\samples.rs`:
+
+```rs
+// tests/samples.rs
+use m68k_emulator::m68k_cpu::CPU;
+use m68k_emulator::memory::Memory;
+
+#[test]
+fn test_loop_program() {
+    let mut cpu = CPU::new(Memory::new(vec![0; 0x400000]));
+    let program = [
+        0x70, 0x05,       // MOVEQ #5, D0
+        0x53, 0x40,       // SUBQ.W #1, D0
+        0x66, 0xFC,       // BNE -4
+        0x4E, 0x71,       // NOP
+    ];
+    cpu.load_program(0x1000, &program);
+    for _ in 0..6 {
+        cpu.step();
+    }
+    assert_eq!(cpu.d[0], 0);
+    assert_eq!(cpu.pc, 0x100A);
+    // The cycle count assertion here is approximate – adjust as needed.
+    assert_eq!(cpu.cycle_count, 4 + 5 * (8 + 12) + 4); // MOVEQ + 5*(SUBQ+BNE) + NOP
+}
+
+#[test]
+fn test_interrupt_sample() {
+    let mut cpu = CPU::new(Memory::new(vec![0; 0x400000]));
+    let program = [
+        0x4E, 0x71,       // NOP
+        0x4E, 0x72, 0x27, 0x00, // STOP #0x2700
+    ];
+    cpu.memory.write_long(0x64, 0x2000).expect("Failed to write vector 25"); // Level 1 vector
+    let interrupt_handler = [
+        0x4E, 0x75,       // RTS
+    ];
+    cpu.load_program(0x1000, &program);
+    cpu.load_program(0x2000, &interrupt_handler);
+    cpu.step(); // NOP
+    cpu.step(); // STOP
+    assert!(cpu.halted);
+    cpu.request_interrupt(1, None);
+    cpu.step(); // Interrupt
+    assert_eq!(cpu.pc, 0x1006); // After STOP
+    assert!(!cpu.halted);
+}
+
+```
