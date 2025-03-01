@@ -1,3 +1,84 @@
+//! m68k_cpu.rs - Motorola 68000 (68k) CPU Emulator Core
+//! --- Version 0.3.1
+//!
+//! This file implements the core of a Motorola 68000 CPU emulator. It defines the essential
+//! components including CPU registers (data and address registers), a program counter, status
+//! register, and a memory interface. The code handles instruction prefetching, decoding, execution,
+//! cycles calculation, as well as exceptions and interrupts, providing a comprehensive emulation of
+//! the 68k CPU behavior.
+//!
+//! # Features
+//!
+//! - **Instruction Decoding and Execution:** Implements a broad range of 68k operations such as
+//!   arithmetic (ADD, SUB, MULS, DIVU, DIVS), logical (AND, OR, EOR, NOT), bit manipulation (BSET,
+//!   BCLR, BCHG, BTST), control flow (Branch, Jump, JSR, RTS), and more.
+//! - **Addressing Modes:** Supports multiple addressing modes including Data/Register Direct,
+//!   Address Register Indirect, Indexed, Displacement, PC-relative modes, Immediate, and more.
+//! - **Cycle-Accurate Emulation:** Computes execution cycles dynamically based on addressing modes,
+//!   operand sizes, and operations, aiming for accurate timing in emulation.
+//! - **Exception and Interrupt Handling:** Provides mechanisms to trigger exceptions (e.g., Address
+//!   Error) and manage interrupts with nested interrupt levels and bus state management.
+//! - **Memory Operations:** Implements safe memory access routines for byte, word, and long
+//!   operations, complete with error handling to integrate with the exception system.
+//!
+//! # Implementation Details
+//!
+//! - **CPU Structure:** The main `CPU` struct encapsulates:
+//!   - General-purpose registers (D0-D7 and A0-A7).
+//!   - Program counter (`pc`), status register (`sr`), and a memory interface.
+//!   - A prefetch queue to optimize instruction fetching.
+//!   - Cycle counting for tracking execution time.
+//!   - Internal state flags, such as `exception_in_progress` to manage recursive exceptions.
+//!
+//! - **Instruction Decoding:** The `decode()` function fetches an opcode, interprets addressing modes,
+//!   and generates an `Instruction` struct that contains the operation code, optional size, source, and
+//!   destination operands.
+//!
+//! - **Execution Engine:** The `execute()` function matches the decoded instruction's operation, performs
+//!   the required read/write operations, updates CPU flags and registers, and computes the operation's
+//!   cycle cost.
+//!
+//! - **Memory and Bus Management:** Memory read/write abstraction and bus state transitions are managed
+//!   to emulate the actual hardware behavior, including interrupt acknowledgement and data transfer
+//!   delays.
+//!
+//! # Technical Strategy
+//!
+//! - The design leverages Rust’s strong type system using enums (`Operation`, `Operand`, and `Size`) to
+//!   enforce correctness and clarity.
+//! - Each CPU operation is implemented with precise control over operand handling, flag updates, and cycle
+//!   counting, making the emulation both accurate and modular.
+//! - Safety and error handling are integral, with checks for addressing and memory errors to trigger
+//!   exceptions, thus preventing unintended recursive fault conditions.
+//!
+//! # Versioning and Maintenance
+//!
+//! - Version: 1.0.0
+//! - Part of the m68k_emulator project.
+//! - Recent updates include improved addressing mode decode logic, refined cycle counting, and enhanced
+//!   exception handling.
+//!
+//! # Usage
+//!
+//! - Create a new CPU instance with a memory implementation using `CPU::new(memory)`.
+//! - Control execution by repeatedly fetching, decoding, and executing instructions.
+//! - Utilize provided methods for injecting interrupts and handling CPU exceptions.
+//!
+//! # Future Enhancements
+//!
+//! - Extend the instruction set with additional 68k operations.
+//! - Integrate more detailed cycle-accurate simulation and hardware-level timing.
+//! - Improve debugging support with detailed logging and tracing capabilities.
+//!
+//! # Authors and Contributors
+//!
+//! - Original Author: DoubleGate
+//! - GitHub Location: https://github.com/doublegate/m68k_emulator/blob/main/src/m68k_cpu.rs
+//!
+//! # License
+//!
+//! - Distributed under the MIT License.
+//! 
 // src/m68k_cpu.rs
 use crate::memory::Memory;
 use crate::memory::Exception;
@@ -761,7 +842,14 @@ impl CPU {
             let src_mode = ((opcode >> 3) & 0x7) as u8;
             let src_reg = (opcode & 0x7) as u8;
             let src = self.decode_ea(src_mode, src_reg, size);
-            let dst = self.decode_ea(dst_mode, dst_reg, size);
+            let mut dst = self.decode_ea(dst_mode, dst_reg, size);
+            // For MOVE.B, a destination of type AddressRegister is not allowed.
+            // Convert an AddressRegister destination into Indirect addressing.
+            if size == Size::Byte {
+                 if let Operand::AddressRegister(reg) = dst {
+                      dst = Operand::Indirect(reg);
+                 }
+            }
             return Instruction {
                 operation: Operation::Move,
                 size: Some(size),
@@ -2929,6 +3017,7 @@ impl CPU {
         }
         cycles
     }
+
     pub fn step(&mut self) -> u32 {
         if self.halted && self.pending_interrupts.is_empty() {
             return 0;
@@ -2945,9 +3034,11 @@ impl CPU {
         let cycles = self.execute(instr);
         self.cycle_count += cycles as u64;
         self.interrupt_ack = None;
-        self.prefetch(); // Prefetch after execution.
+        // Removed the extra prefetch() call to avoid advancing the PC beyond what decode/fetch_word already does.
+        // self.prefetch();
         cycles
     }
+
     // Modified load_program: if the destination is in ROM, use load_rom_data
     pub fn load_program(&mut self, address: u32, program: &[u8]) {
         if address < 0x400000 {
