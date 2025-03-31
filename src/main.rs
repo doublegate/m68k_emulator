@@ -1,110 +1,116 @@
 // src/main.rs - 68K Emulator Entry Point
 // --------------------------------------------------------------------
 // This file demonstrates the initialization and use of a 68K emulator.
-// It sets up the memory (dividing it into ROM and RAM regions), creates a CPU
+// It sets up memory (dividing it into ROM and RAM regions), creates a CPU
 // instance, loads a sample program into ROM, initializes CPU registers, and then
-// executes a series of instructions (NOP, MOVE.B, RTS). The execution state is
-// printed step-by-step to illustrate the emulation process.
+// executes a series of instructions (NOP, MOVE.B, RTS). Additionally, if run with
+// the "--run-tests" flag, this executable will invoke the integration test suite.
 // --------------------------------------------------------------------
 
-use m68k_emulator::m68k_cpu::CPU; // Import the CPU module to simulate the Motorola 68K CPU.
-use m68k_emulator::memory::Memory; // Import the Memory module for handling memory access.
+use m68k_emulator::m68k_cpu::CPU;   // Import the CPU module to simulate the Motorola 68K CPU.
+use m68k_emulator::memory::Memory;   // Import the Memory module for handling memory access.
+use std::env;
+use std::process::Command;
 
 fn main() {
     // ----------------------------------------------------------------
-    // Memory Initialization:
-    // Create a memory instance with 16 MB backing storage.
-    // In this emulator, the memory is conceptually divided into two regions:
-    //   1. ROM: The lower 4 MB (addresses 0x000000 to 0x3FFFFF) is considered read-only.
-    //   2. RAM: The upper region (addresses 0xFF0000 to 0xFFFFFF) is used as writable RAM.
-    // Although the Memory structure receives a full 16 MB vector, internal addressing
-    // mechanisms will ensure correct read/write operations on each region.
+    // Test Runner Option:
+    // If the command-line argument "--run-tests" is supplied, spawn the "cargo test"
+    // command to run all tests from the tests/ directory. This approach leverages Rust’s
+    // standard testing framework while keeping the production code separate.
     // ----------------------------------------------------------------
-    let mut memory = Memory::new(vec![0; 16 * 1024 * 1024]); // 16 MB of memory initialized to zeros.
+    if env::args().any(|arg| arg == "--run-tests") {
+        println!("Running tests via cargo test ...");
+        let status = Command::new("cargo")
+            .arg("test")
+            .status()
+            .expect("Failed to run cargo test");
+        std::process::exit(status.code().unwrap_or(1));
+    }
+
+    // ----------------------------------------------------------------
+    // Memory Initialization:
+    // Create a memory instance with 16 MB backing storage. The Memory object divides the
+    // address space into two regions:
+    //   - ROM: Addresses 0x000000 to 0x3FFFFF (read-only during execution).
+    //   - RAM: Addresses 0xFF0000 to 0xFFFFFF (writable).
+    // Although 16 MB is allocated, internal logic in Memory will correctly route accesses.
+    // ----------------------------------------------------------------
+    let memory = Memory::new(vec![0; 16 * 1024 * 1024]); // 16 MB of zero-initialized memory.
 
     // ----------------------------------------------------------------
     // CPU Initialization:
-    // Create a new CPU instance and pass the memory instance to it.
-    // The CPU structure maintains state such as data and address registers,
-    // the program counter (PC), the status register (SR), and other flags necessary
-    // for the execution of 68K instructions.
+    // Create a new CPU instance with the initialized memory. The CPU structure maintains
+    // all processor state such as data and address registers, the program counter (PC),
+    // the status register (SR), and various flags.
     // ----------------------------------------------------------------
     let mut cpu = CPU::new(memory);
 
     // ----------------------------------------------------------------
     // Program Definition:
     // Define an example program consisting of three instructions:
-    //   - 0x4E71 (NOP): No-Operation. This instruction advances the PC and
-    //                    consumes CPU cycles without changing state.
-    //   - 0x1080 (MOVE.B D0, (A0)): Moves the lower 8 bits from data register D0
-    //                    into the memory location pointed to by address register A0.
-    //   - 0x4E75 (RTS): Return from Subroutine, which pops a return address
-    //                    from the stack and transfers control accordingly.
+    //   - 0x4E71 (NOP): No-Operation. Advances the PC and consumes CPU cycles.
+    //   - 0x1080 (MOVE.B D0, (A0)): Transfers the lower 8 bits from data register D0
+    //         into the memory location pointed to by address register A0.
+    //   - 0x4E75 (RTS): Return from Subroutine; pops a return address from the stack.
     // ----------------------------------------------------------------
     let program = [
-        0x4E, 0x71, // NOP: Does nothing, just moves the PC forward.
-        0x10, 0x80, // MOVE.B D0, (A0): Move the byte in D0 to the memory address in A0.
-        0x4E, 0x75, // RTS: Return from Subroutine; simulates end-of-program.
+        0x4E, 0x71, // NOP: Advances the PC with no state change.
+        0x10, 0x80, // MOVE.B D0, (A0): Move low-order byte of D0 to the memory address in A0.
+        0x4E, 0x75, // RTS: Simulate end-of-program by returning from a subroutine.
     ];
 
     // ----------------------------------------------------------------
     // Program Loading:
-    // Load the above-defined program into the ROM region of memory. The starting
-    // address chosen is 0x1000, which is safely within the ROM space as it remains below 0x400000.
-    // The CPU's load_program function copies the program bytes into the appropriate memory segment.
+    // Load the above-defined program into the ROM region starting at address 0x1000.
+    // The CPU’s load_program method copies the program bytes into ROM and then performs
+    // a prefetch of two words, advancing the PC by 4.
     // ----------------------------------------------------------------
     cpu.load_program(0x1000, &program);
 
     // ----------------------------------------------------------------
     // CPU Register Setup:
-    // Initialize CPU registers with test values before execution:
-    //   - Set the data register D0 to 0x42. This is the source value for the MOVE.B instruction.
-    //   - Set the address register A0 to 0xFF0000. This address falls within the writable RAM region.
-    //     Internally, memory writes for RAM mask addresses with 0xFFFF, meaning that an address
-    //     of 0xFF0000 targets index 0 of the RAM array.
+    // Before execution, set up test register values:
+    //   - D0 is set to 0x42 to serve as the source value for the MOVE.B instruction.
+    //   - A0 is set to 0xFF0000 so that the destination memory falls within the writable RAM.
     // ----------------------------------------------------------------
     cpu.d[0] = 0x42;
     cpu.a[0] = 0xFF0000;
 
     // ----------------------------------------------------------------
     // Initial CPU State:
-    // Print the initial program counter (PC) value. The PC indicates where in memory
-    // the CPU will fetch its next instruction.
+    // Print the initial program counter (PC) to confirm proper initialization.
     // ----------------------------------------------------------------
     println!("Initial PC: {:06X}", cpu.pc);
 
     // ----------------------------------------------------------------
     // Instruction Execution: NOP
-    // Execute the NOP instruction. This step simulates the fetch-decode-execute cycle.
-    // The PC is advanced and a specific number of cycles are consumed.
+    // Execute the NOP instruction. This simulates one fetch–decode–execute cycle.
+    // The PC is advanced and a fixed number of cycles (4) are consumed.
     // ----------------------------------------------------------------
     let cycles = cpu.step();
     println!("After NOP: PC={:06X}, Cycles={}", cpu.pc, cycles);
 
     // ----------------------------------------------------------------
     // Instruction Execution: MOVE.B D0, (A0)
-    // Execute the MOVE.B instruction which transfers the low-order byte from D0 to the
-    // memory location addressed by A0.
-    // The PC will be updated, and the CPU will reflect the data transfer after consuming
-    // additional cycles.
+    // Execute the MOVE.B instruction, transferring the byte from D0 into the RAM address A0.
+    // The PC is updated and additional cycles are consumed to handle effective addressing.
     // ----------------------------------------------------------------
     let cycles = cpu.step();
     println!("After MOVE.B: PC={:06X}, Cycles={}", cpu.pc, cycles);
 
     // ----------------------------------------------------------------
     // Memory Verification:
-    // To verify that the MOVE.B instruction correctly stored the value, read the data byte
-    // from the RAM location pointed to by A0 (0xFF0000). The read_byte method returns a Result,
-    // so we use unwrap_or(0) to fallback on 0 in case of an error.
+    // Verify that the MOVE.B instruction correctly stored the value by reading the byte
+    // from the RAM location pointed to by A0.
     // ----------------------------------------------------------------
     let memory_value = cpu.memory.read_byte(cpu.a[0]).unwrap_or(0);
     println!("Memory[A0]={:02X}", memory_value);
 
     // ----------------------------------------------------------------
     // Instruction Execution: RTS
-    // Execute the RTS (Return from Subroutine) instruction. This simulates a subroutine
-    // return by popping a return address from the CPU stack.
-    // The PC is updated to the popped return address, and the corresponding cycles are consumed.
+    // Execute the RTS instruction to simulate a subroutine return.
+    // The PC is updated to the popped return address and the corresponding cycles are consumed.
     // ----------------------------------------------------------------
     let cycles = cpu.step();
     println!("After RTS: PC={:06X}, Cycles={}", cpu.pc, cycles);
