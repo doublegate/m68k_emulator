@@ -183,6 +183,74 @@ pub fn test_stop_user_mode() {
     );
 }
 
+fn test_movea_and_ccr_and_shift_and_indexed_addr() {
+    let mut cpu = CPU::new(Memory::new(vec![0; 0x400000]));
+    // MOVEA.W #$8000, A0 (0x307C, 0x8000) should sign-extend to 0xFFFF8000 and preserve CCR.
+    cpu.sr = 0x001F; // User mode with XNZVC all set
+    cpu.load_program(0x1000, &[0x30, 0x7C, 0x80, 0x00]);
+    cpu.step();
+    assert_eq!(
+        cpu.a[0], 0xFFFF_8000,
+        "MOVEA.W should sign-extend to 32 bits."
+    );
+    assert_eq!(
+        cpu.sr & 0x001F,
+        0x001F,
+        "MOVEA should not modify CCR flags."
+    );
+
+    // ORI #$15, CCR (0x003C, 0x0015) in user mode should succeed without privilege violation.
+    cpu.sr = 0x0000; // User mode, all flags clear
+    cpu.load_program(0x1000, &[0x00, 0x3C, 0x00, 0x15]);
+    cpu.step();
+    assert_eq!(
+        cpu.sr & 0x001F,
+        0x0015,
+        "ORI to CCR should work in user mode."
+    );
+
+    // ASR.B D1, D0 (0xE220) with D1 = 8 and D0 = 0x80 should sign-fill all 8 bits (result 0xFF, C=1).
+    cpu.d[0] = 0x0000_0080;
+    cpu.d[1] = 8;
+    cpu.load_program(0x1000, &[0xE2, 0x20]);
+    cpu.step();
+    assert_eq!(
+        cpu.d[0] & 0xFF,
+        0xFF,
+        "ASR.B of 0x80 by 8 should sign-fill to 0xFF."
+    );
+    assert_ne!(
+        cpu.sr & 0x0001,
+        0,
+        "ASR.B of 0x80 by 8 should set Carry to bit 7."
+    );
+
+    // LSR.B D1, D0 (0xE228) with D1 = 8 and D0 = 0x80 should shift all 8 bits out (result 0, Z=1, C=1).
+    cpu.d[0] = 0x0000_0080;
+    cpu.d[1] = 8;
+    cpu.load_program(0x1000, &[0xE2, 0x28]);
+    cpu.step();
+    assert_eq!(cpu.d[0] & 0xFF, 0, "LSR.B by 8 should zero the byte.");
+    assert_ne!(
+        cpu.sr & 0x0001,
+        0,
+        "LSR.B of 0x80 by 8 should set Carry to bit 7."
+    );
+
+    // MOVE.B (2, A0, A1.L), D2 (0x1430, 0x9802) uses A1 as index register (bit 15 = 1, reg = 1, L = 1, disp = 2).
+    cpu.a[0] = 0xFF2000;
+    cpu.a[1] = 0x000010;
+    cpu.d[1] = 0x000000; // Ensure D1 is different from A1 so A1 must be selected.
+    cpu.memory.write_byte(0xFF2012, 0xAB).unwrap();
+    cpu.load_program(0x1000, &[0x14, 0x30, 0x98, 0x02]);
+    cpu.step();
+    assert_eq!(
+        cpu.d[2] & 0xFF,
+        0xAB,
+        "Indexed EA with D/A=1 should use address register A1."
+    );
+}
+
 /// Public function to run all CPU tests.
 ///
 /// This function aggregates all individual test cases for the CPU instruction set into a single
@@ -196,6 +264,7 @@ pub fn run_cpu_tests() {
     test_divu_zero_divide();
     test_stop_supervisor();
     test_stop_user_mode();
+    test_movea_and_ccr_and_shift_and_indexed_addr();
     println!("All CPU tests passed.");
 }
 

@@ -536,6 +536,19 @@ impl CPU {
         (self.interrupt_ack, self.bus_state)
     }
 
+    fn index_register_value(&self, idx_reg: u8, idx_size: Size) -> i32 {
+        let raw = if (idx_reg & 0x8) != 0 {
+            self.a[(idx_reg & 0x7) as usize]
+        } else {
+            self.d[(idx_reg & 0x7) as usize]
+        };
+        match idx_size {
+            Size::Word => (raw as i16) as i32,
+            Size::Long => raw as i32,
+            _ => unreachable!(),
+        }
+    }
+
     fn decode_ea(&mut self, mode: u8, reg: u8, size: Size) -> Operand {
         match mode {
             0 => Operand::DataRegister(reg),
@@ -550,7 +563,7 @@ impl CPU {
             6 => {
                 let ext = self.fetch_word();
                 let disp = ext as i8;
-                let index_reg = (ext >> 12) & 0x7;
+                let index_reg = ((ext >> 12) & 0x7) | (((ext >> 15) & 0x1) << 3);
                 let index_size = if (ext & 0x800) != 0 {
                     Size::Long
                 } else {
@@ -568,7 +581,7 @@ impl CPU {
                 3 => {
                     let ext = self.fetch_word();
                     let disp = ext as i8;
-                    let index_reg = (ext >> 12) & 0x7;
+                    let index_reg = ((ext >> 12) & 0x7) | (((ext >> 15) & 0x1) << 3);
                     let index_size = if (ext & 0x800) != 0 {
                         Size::Long
                     } else {
@@ -631,11 +644,7 @@ impl CPU {
             }
             Operand::Indexed(reg, disp, idx_reg, idx_size) => {
                 let base = self.a[*reg as usize];
-                let index = match idx_size {
-                    Size::Word => (self.d[*idx_reg as usize] as i16) as i32,
-                    Size::Long => self.d[*idx_reg as usize] as i32,
-                    _ => unreachable!(),
-                };
+                let index = self.index_register_value(*idx_reg, *idx_size);
                 let addr = base
                     .wrapping_add(*disp as i32 as u32)
                     .wrapping_add(index as u32);
@@ -665,11 +674,7 @@ impl CPU {
             }
             Operand::PCIndexed(disp, idx_reg, idx_size) => {
                 let base = self.pc - 2;
-                let index = match idx_size {
-                    Size::Word => (self.d[*idx_reg as usize] as i16) as i32,
-                    Size::Long => self.d[*idx_reg as usize] as i32,
-                    _ => unreachable!(),
-                };
+                let index = self.index_register_value(*idx_reg, *idx_size);
                 let addr = base
                     .wrapping_add(*disp as i32 as u32)
                     .wrapping_add(index as u32);
@@ -723,11 +728,7 @@ impl CPU {
             }
             Operand::Indexed(reg, disp, idx_reg, idx_size) => {
                 let base = self.a[*reg as usize];
-                let index = match idx_size {
-                    Size::Word => (self.d[*idx_reg as usize] as i16) as i32,
-                    Size::Long => self.d[*idx_reg as usize] as i32,
-                    _ => unreachable!(),
-                };
+                let index = self.index_register_value(*idx_reg, *idx_size);
                 let addr = base
                     .wrapping_add(*disp as i32 as u32)
                     .wrapping_add(index as u32);
@@ -945,7 +946,7 @@ impl CPU {
             };
         }
 
-        // --- MOVE instructions ---
+        // --- MOVE / MOVEA instructions ---
         if (opcode & 0xC000) == 0x0000 && (opcode & 0x3000) != 0x0000 {
             let size = match (opcode >> 12) & 0x3 {
                 1 => Size::Byte,
@@ -958,6 +959,14 @@ impl CPU {
             let src_mode = ((opcode >> 3) & 0x7) as u8;
             let src_reg = (opcode & 0x7) as u8;
             let src = self.decode_ea(src_mode, src_reg, size);
+            if dst_mode == 1 && size != Size::Byte {
+                return Instruction {
+                    operation: Operation::Movea,
+                    size: Some(size),
+                    src: Some(src),
+                    dst: Some(Operand::AddressRegister(dst_reg)),
+                };
+            }
             let mut dst = self.decode_ea(dst_mode, dst_reg, size);
             if size == Size::Byte {
                 if let Operand::AddressRegister(reg) = dst {
@@ -1476,22 +1485,6 @@ impl CPU {
             };
         }
 
-        // --- MOVEA ---
-        if (opcode & 0xF1FF) == 0x303C {
-            let size = match (opcode >> 6) & 0x3 {
-                1 | 2 => Size::Long,
-                _ => Size::Word,
-            };
-            let src = self.decode_ea(((opcode >> 3) & 0x7) as u8, (opcode & 0x7) as u8, size);
-            let an = ((opcode >> 9) & 0x7) as u8;
-            return Instruction {
-                operation: Operation::Movea,
-                size: Some(Size::Long),
-                src: Some(src),
-                dst: Some(Operand::AddressRegister(an)),
-            };
-        }
-
         // --- MOVE to CCR / MOVE to SR ---
         if (opcode & 0xFFC0) == 0x44C0 || (opcode & 0xFFC0) == 0x46C0 {
             let mode = ((opcode >> 3) & 0x7) as u8;
@@ -1782,18 +1775,25 @@ impl CPU {
                 let size = instr.size.unwrap();
                 let src = instr.src.unwrap();
                 let dst = instr.dst.unwrap();
-                let shift_count = self.get_operand_value(Size::Long, &src) % size.bits();
-                let dst_val = self.get_operand_value(size, &dst);
-                let result = dst_val >> shift_count;
-                self.set_operand_value(size, &dst, result);
-                let n = (result & (1 << (size.bits() - 1))) != 0;
-                let z = result == 0;
-                let c = if shift_count > 0 {
-                    (dst_val >> (shift_count - 1)) & 1 != 0
+                let shift_count = self.get_operand_value(Size::Long, &src) & 0x3F;
+                let bits = size.bits();
+                let dst_val = self.get_operand_value(size, &dst) & size.mask();
+                let (result, c, x) = if shift_count == 0 {
+                    (dst_val, false, (self.sr & 0x10) != 0)
+                } else if shift_count < bits {
+                    let res = dst_val >> shift_count;
+                    let carry = ((dst_val >> (shift_count - 1)) & 1) != 0;
+                    (res, carry, carry)
+                } else if shift_count == bits {
+                    let carry = ((dst_val >> (bits - 1)) & 1) != 0;
+                    (0, carry, carry)
                 } else {
-                    false
+                    (0, false, false)
                 };
-                self.set_flags(n, z, false, c, c);
+                self.set_operand_value(size, &dst, result);
+                let n = (result & (1 << (bits - 1))) != 0;
+                let z = result == 0;
+                self.set_flags(n, z, false, c, x);
                 cycles = match size {
                     Size::Byte | Size::Word => 6,
                     Size::Long => 8,
@@ -1803,22 +1803,27 @@ impl CPU {
                 let size = instr.size.unwrap();
                 let src = instr.src.unwrap();
                 let dst = instr.dst.unwrap();
-                let shift_count = self.get_operand_value(Size::Long, &src) % size.bits();
-                let dst_val = self.get_operand_value(size, &dst);
-                let result = (dst_val << shift_count) & size.mask();
-                self.set_operand_value(size, &dst, result);
-                let n = (result & (1 << (size.bits() - 1))) != 0;
-                let z = result == 0;
-                let c = if shift_count > 0 {
-                    (dst_val & (1 << (size.bits() - shift_count))) != 0
+                let shift_count = self.get_operand_value(Size::Long, &src) & 0x3F;
+                let bits = size.bits();
+                let dst_val = self.get_operand_value(size, &dst) & size.mask();
+                let (result, c, v, x) = if shift_count == 0 {
+                    (dst_val, false, false, (self.sr & 0x10) != 0)
+                } else if shift_count < bits {
+                    let res = (dst_val << shift_count) & size.mask();
+                    let carry = ((dst_val >> (bits - shift_count)) & 1) != 0;
+                    let sign = (dst_val >> (bits - 1)) & 1;
+                    let ovf = (0..=shift_count).any(|i| ((dst_val >> (bits - 1 - i)) & 1) != sign);
+                    (res, carry, ovf, carry)
+                } else if shift_count == bits {
+                    let carry = (dst_val & 1) != 0;
+                    (0, carry, dst_val != 0, carry)
                 } else {
-                    false
+                    (0, false, dst_val != 0, false)
                 };
-                let v = (0..shift_count).any(|i| {
-                    let bit = (dst_val >> (size.bits() - 1 - i)) & 1;
-                    bit != (dst_val >> (size.bits() - 1)) & 1
-                });
-                self.set_flags(n, z, v, c, c);
+                self.set_operand_value(size, &dst, result);
+                let n = (result & (1 << (bits - 1))) != 0;
+                let z = result == 0;
+                self.set_flags(n, z, v, c, x);
                 cycles = match size {
                     Size::Byte | Size::Word => 6,
                     Size::Long => 8,
@@ -2316,11 +2321,7 @@ impl CPU {
                     }
                     Operand::Indexed(reg, disp, idx_reg, idx_size) => {
                         let base = self.a[reg as usize];
-                        let index = match idx_size {
-                            Size::Word => (self.d[idx_reg as usize] as i16) as i32,
-                            Size::Long => self.d[idx_reg as usize] as i32,
-                            _ => unreachable!(),
-                        };
+                        let index = self.index_register_value(idx_reg, idx_size);
                         base.wrapping_add(disp as i32 as u32)
                             .wrapping_add(index as u32)
                     }
@@ -2331,11 +2332,7 @@ impl CPU {
                     }
                     Operand::PCIndexed(disp, idx_reg, idx_size) => {
                         let base = self.pc.wrapping_sub(6);
-                        let index = match idx_size {
-                            Size::Word => (self.d[idx_reg as usize] as i16) as i32,
-                            Size::Long => self.d[idx_reg as usize] as i32,
-                            _ => unreachable!(),
-                        };
+                        let index = self.index_register_value(idx_reg, idx_size);
                         base.wrapping_add(disp as i32 as u32)
                             .wrapping_add(index as u32)
                     }
@@ -2831,11 +2828,7 @@ impl CPU {
                                 }
                                 Operand::Indexed(reg, disp, idx_reg, idx_size) => {
                                     let base = self.a[reg as usize];
-                                    let index = match idx_size {
-                                        Size::Word => (self.d[idx_reg as usize] as i16) as i32,
-                                        Size::Long => self.d[idx_reg as usize] as i32,
-                                        _ => unreachable!(),
-                                    };
+                                    let index = self.index_register_value(idx_reg, idx_size);
                                     base.wrapping_add(disp as i32 as u32)
                                         .wrapping_add(index as u32)
                                 }
@@ -2869,11 +2862,7 @@ impl CPU {
                         }
                         Operand::Indexed(reg, disp, idx_reg, idx_size) => {
                             let base = self.a[reg as usize];
-                            let index = match idx_size {
-                                Size::Word => (self.d[idx_reg as usize] as i16) as i32,
-                                Size::Long => self.d[idx_reg as usize] as i32,
-                                _ => unreachable!(),
-                            };
+                            let index = self.index_register_value(idx_reg, idx_size);
                             base.wrapping_add(disp as i32 as u32)
                                 .wrapping_add(index as u32)
                         }
@@ -2884,11 +2873,7 @@ impl CPU {
                         }
                         Operand::PCIndexed(disp, idx_reg, idx_size) => {
                             let base = self.pc.wrapping_sub(6);
-                            let index = match idx_size {
-                                Size::Word => (self.d[idx_reg as usize] as i16) as i32,
-                                Size::Long => self.d[idx_reg as usize] as i32,
-                                _ => unreachable!(),
-                            };
+                            let index = self.index_register_value(idx_reg, idx_size);
                             base.wrapping_add(disp as i32 as u32)
                                 .wrapping_add(index as u32)
                         }
@@ -3057,18 +3042,25 @@ impl CPU {
                 let size = instr.size.unwrap();
                 let src = instr.src.unwrap();
                 let dst = instr.dst.unwrap();
-                let shift_count = self.get_operand_value(Size::Long, &src) % size.bits();
-                let dst_val = self.get_operand_value(size, &dst);
-                let result = (dst_val << shift_count) & size.mask();
-                self.set_operand_value(size, &dst, result);
-                let n = (result & (1 << (size.bits() - 1))) != 0;
-                let z = result == 0;
-                let c = if shift_count > 0 {
-                    (dst_val & (1 << (size.bits() - shift_count))) != 0
+                let shift_count = self.get_operand_value(Size::Long, &src) & 0x3F;
+                let bits = size.bits();
+                let dst_val = self.get_operand_value(size, &dst) & size.mask();
+                let (result, c, x) = if shift_count == 0 {
+                    (dst_val, false, (self.sr & 0x10) != 0)
+                } else if shift_count < bits {
+                    let res = (dst_val << shift_count) & size.mask();
+                    let carry = ((dst_val >> (bits - shift_count)) & 1) != 0;
+                    (res, carry, carry)
+                } else if shift_count == bits {
+                    let carry = (dst_val & 1) != 0;
+                    (0, carry, carry)
                 } else {
-                    false
+                    (0, false, false)
                 };
-                self.set_flags(n, z, false, c, c);
+                self.set_operand_value(size, &dst, result);
+                let n = (result & (1 << (bits - 1))) != 0;
+                let z = result == 0;
+                self.set_flags(n, z, false, c, x);
                 cycles = match size {
                     Size::Byte | Size::Word => 6,
                     Size::Long => 8,
@@ -3342,13 +3334,14 @@ impl CPU {
                 let size = instr.size.unwrap();
                 let src = instr.src.unwrap();
                 let dst = instr.dst.unwrap();
-                let value = self.get_operand_value(size, &src);
+                let raw = self.get_operand_value(size, &src);
+                let value = if size == Size::Word {
+                    raw as u16 as i16 as i32 as u32
+                } else {
+                    raw
+                };
                 self.set_operand_value(Size::Long, &dst, value);
-                cycles = match size {
-                    Size::Word => 4,
-                    Size::Long => 4,
-                    Size::Byte => 4,
-                } + self.ea_cycles(&src, size);
+                cycles = 4 + self.ea_cycles(&src, size);
             }
             Operation::MoveCcr => {
                 let src = instr.src.unwrap();
@@ -3379,34 +3372,22 @@ impl CPU {
                 }
             }
             Operation::AndiCcr => {
-                if !self.check_supervisor() {
-                    cycles = 34;
-                } else {
-                    let src = instr.src.unwrap();
-                    let value = self.get_operand_value(Size::Byte, &src) as u16;
-                    self.sr = (self.sr & 0xFF00) | ((self.sr & 0x1F) & (value & 0x1F));
-                    cycles = 20;
-                }
+                let src = instr.src.unwrap();
+                let value = self.get_operand_value(Size::Byte, &src) as u16;
+                self.sr = (self.sr & 0xFF00) | ((self.sr & 0x1F) & (value & 0x1F));
+                cycles = 20;
             }
             Operation::OriCcr => {
-                if !self.check_supervisor() {
-                    cycles = 34;
-                } else {
-                    let src = instr.src.unwrap();
-                    let value = self.get_operand_value(Size::Byte, &src) as u16;
-                    self.sr = (self.sr & 0xFF00) | ((self.sr & 0x1F) | (value & 0x1F));
-                    cycles = 20;
-                }
+                let src = instr.src.unwrap();
+                let value = self.get_operand_value(Size::Byte, &src) as u16;
+                self.sr = (self.sr & 0xFF00) | ((self.sr & 0x1F) | (value & 0x1F));
+                cycles = 20;
             }
             Operation::EoriCcr => {
-                if !self.check_supervisor() {
-                    cycles = 34;
-                } else {
-                    let src = instr.src.unwrap();
-                    let value = self.get_operand_value(Size::Byte, &src) as u16;
-                    self.sr = (self.sr & 0xFF00) | ((self.sr & 0x1F) ^ (value & 0x1F));
-                    cycles = 20;
-                }
+                let src = instr.src.unwrap();
+                let value = self.get_operand_value(Size::Byte, &src) as u16;
+                self.sr = (self.sr & 0xFF00) | ((self.sr & 0x1F) ^ (value & 0x1F));
+                cycles = 20;
             }
             Operation::LslMem => {
                 let size = instr.size.unwrap();
@@ -3424,22 +3405,28 @@ impl CPU {
                 let size = instr.size.unwrap();
                 let src = instr.src.unwrap();
                 let dst = instr.dst.unwrap();
-                let shift_count = self.get_operand_value(Size::Long, &src) % size.bits();
-                let dst_val = self.get_operand_value(size, &dst) as i32;
-                let result = match size {
-                    Size::Byte => (dst_val as i8 >> shift_count) as u32 & 0xFF,
-                    Size::Word => (dst_val as i16 >> shift_count) as u32 & 0xFFFF,
-                    Size::Long => (dst_val >> shift_count) as u32,
+                let shift_count = self.get_operand_value(Size::Long, &src) & 0x3F;
+                let bits = size.bits();
+                let dst_val = self.get_operand_value(size, &dst) & size.mask();
+                let msb = (dst_val & (1 << (bits - 1))) != 0;
+                let (result, c, x) = if shift_count == 0 {
+                    (dst_val, false, (self.sr & 0x10) != 0)
+                } else if shift_count < bits {
+                    let res = match size {
+                        Size::Byte => ((dst_val as u8 as i8) >> shift_count) as u8 as u32,
+                        Size::Word => ((dst_val as u16 as i16) >> shift_count) as u16 as u32,
+                        Size::Long => ((dst_val as i32) >> shift_count) as u32,
+                    };
+                    let carry = ((dst_val >> (shift_count - 1)) & 1) != 0;
+                    (res, carry, carry)
+                } else {
+                    let res = if msb { size.mask() } else { 0 };
+                    (res, msb, msb)
                 };
                 self.set_operand_value(size, &dst, result);
-                let n = (result & (1 << (size.bits() - 1))) != 0;
+                let n = (result & (1 << (bits - 1))) != 0;
                 let z = result == 0;
-                let c = if shift_count > 0 {
-                    (dst_val >> (shift_count - 1)) & 1 != 0
-                } else {
-                    false
-                };
-                self.set_flags(n, z, false, c, c);
+                self.set_flags(n, z, false, c, x);
                 cycles = match size {
                     Size::Byte | Size::Word => 6,
                     Size::Long => 8,
