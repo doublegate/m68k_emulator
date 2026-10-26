@@ -7,8 +7,8 @@
 // the "--run-tests" flag, this executable will invoke the integration test suite.
 // --------------------------------------------------------------------
 
-use m68k_emulator::m68k_cpu::CPU;   // Import the CPU module to simulate the Motorola 68K CPU.
-use m68k_emulator::memory::Memory;   // Import the Memory module for handling memory access.
+use m68k_emulator::m68k_cpu::CPU; // Import the CPU module to simulate the Motorola 68K CPU.
+use m68k_emulator::memory::Memory; // Import the Memory module for handling memory access.
 use std::env;
 use std::process::Command;
 
