@@ -5,15 +5,15 @@
     of the 68K emulator. It includes tests for instructions such as NOP,
     MOVE, ADD, DIVU (with divide-by-zero exception handling), and STOP
     combined with interrupt handling.
-    
+
     Each test function simulates a small portion of the emulator's functionality,
     ensuring that the CPU state (registers, flags, program counter, cycle count)
     is correctly updated after execution.
-    
+
     These functions have been refactored to be callable from a public test runner,
     allowing integration testing both from within Cargo’s test harness and via an
     external invocation.
-    
+
     Detailed technical comments are provided below to explain the rationale behind
     each test case, including expected outcomes, cycle counts, and state transitions.
     --------------------------------------------------------------------
@@ -59,7 +59,10 @@ pub fn test_move() {
     let cycles = cpu.step();
     // Expected PC: starting at 0x1000 -> prefetch sets PC=0x1004, then executing the instruction adds 2, so 0x1006.
     assert_eq!(cpu.pc, 0x1006, "MOVE: PC did not advance as expected.");
-    let mem_val = cpu.memory.read_byte(0xFF0000).expect("Memory read failed in MOVE test");
+    let mem_val = cpu
+        .memory
+        .read_byte(0xFF0000)
+        .expect("Memory read failed in MOVE test");
     assert_eq!(mem_val, 0x42, "MOVE: Memory value mismatch.");
     assert_eq!(cycles, 8, "MOVE: Cycle count mismatch.");
     // Ensure that the CPU flags remain unchanged.
@@ -105,10 +108,13 @@ pub fn test_divu_zero_divide() {
     let mut cpu = CPU::new(Memory::new(rom_data));
     cpu.a[7] = cpu.memory.read_long(0).unwrap_or(0); // A7 = 0xFFFFFE
     cpu.d[0] = 0x10; // Dividend
-    cpu.d[1] = 0;    // Divisor (zero)
+    cpu.d[1] = 0; // Divisor (zero)
     cpu.load_program(0x1000, &[0x80, 0xC1]); // DIVU.W D1, D0
     let cycles = cpu.step();
-    assert_eq!(cpu.pc, 0x3000, "DIVU: PC not set to exception vector on divide by zero.");
+    assert_eq!(
+        cpu.pc, 0x3000,
+        "DIVU: PC not set to exception vector on divide by zero."
+    );
     assert_eq!(cycles, 34, "DIVU: Cycle count mismatch on exception.");
 }
 
@@ -144,13 +150,16 @@ pub fn test_stop_supervisor() {
     cpu.load_program(0x1000, &[0x4E, 0x72, 0x27, 0x00]);
     // Perform prefetch so that the PC is advanced.
     // cpu.prefetch();
-    
+
     let cycles = cpu.step();
     assert!(cpu.halted, "STOP in supervisor mode did not halt the CPU.");
     assert_eq!(cycles, 4, "Cycle count mismatch on supervisor STOP.");
     // Further steps should do nothing when halted.
     let cycles = cpu.step();
-    assert_eq!(cycles, 0, "CPU executed steps while halted in supervisor mode.");
+    assert_eq!(
+        cycles, 0,
+        "CPU executed steps while halted in supervisor mode."
+    );
 }
 
 // Test STOP in user mode (expected to trigger privilege violation exception)
@@ -160,14 +169,18 @@ pub fn test_stop_user_mode() {
     cpu.sr &= !0x2000;
     // Load the privilege violation vector (vector 8) with a handler address (e.g. 0x4000).
     let vec_bytes = [0x00, 0x00, 0x40, 0x00]; // Big-endian for 0x4000.
-    cpu.memory.load_rom_data(8 * 4, &vec_bytes)
+    cpu.memory
+        .load_rom_data(8 * 4, &vec_bytes)
         .expect("Failed to load privilege violation vector");
     // Load the STOP instruction.
     cpu.load_program(0x1000, &[0x4E, 0x72, 0x27, 0x00]);
     let _cycles = cpu.step();
     // In user mode, STOP should trigger the privilege violation exception.
     assert!(!cpu.halted, "STOP in user mode should not halt the CPU.");
-    assert_eq!(cpu.pc, 0x4000, "STOP in user mode did not set PC from privilege violation vector.");
+    assert_eq!(
+        cpu.pc, 0x4000,
+        "STOP in user mode did not set PC from privilege violation vector."
+    );
 }
 
 /// Public function to run all CPU tests.
@@ -189,7 +202,7 @@ pub fn run_cpu_tests() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn run_cpu_tests_wrapper() {
         run_cpu_tests();

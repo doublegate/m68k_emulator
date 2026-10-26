@@ -14,9 +14,9 @@ pub enum Exception {
 
 #[derive(Clone)]
 pub struct Memory {
-    pub rom: Vec<u8>,         // ROM region: typically loaded from an external binary.
+    pub rom: Vec<u8>, // ROM region: typically loaded from an external binary.
     pub ram: Box<[u8; 0x10000]>, // RAM region: a fixed-size 64KB array allocated on the heap.
-    // Future expansion may add support for additional regions such as Z80, VDP, or I/O.
+                      // Future expansion may add support for additional regions such as Z80, VDP, or I/O.
 }
 
 impl Memory {
@@ -35,7 +35,7 @@ impl Memory {
             ram: Box::new([0; 0x10000]), // Initialize 64KB of RAM to zeros.
         }
     }
-    
+
     /// Loads data directly into the ROM region.
     ///
     /// # Parameters
@@ -53,10 +53,10 @@ impl Memory {
         if address + data.len() as u32 > self.rom.len() as u32 {
             return Err(Exception::AddressError);
         }
-        self.rom[address as usize .. (address as usize + data.len())].copy_from_slice(data);
+        self.rom[address as usize..(address as usize + data.len())].copy_from_slice(data);
         Ok(())
     }
-    
+
     /// Reads a byte from the given address.
     ///
     /// # Parameters
@@ -78,7 +78,7 @@ impl Memory {
                 } else {
                     Err(Exception::AddressError)
                 }
-            },
+            }
             // For RAM, use bitmasking to map the address into the 64KB array.
             0xFF0000..=0xFFFFFF => Ok(self.ram[(addr & 0xFFFF) as usize]),
             // Any access outside defined regions returns an AddressError.
@@ -108,7 +108,7 @@ impl Memory {
             _ => Err(Exception::AddressError),
         }
     }
-    
+
     /// Reads a 16-bit word from the specified address.
     ///
     /// # Parameters
@@ -132,7 +132,7 @@ impl Memory {
             Ok((high << 8) | low)
         }
     }
-    
+
     /// Writes a 16-bit word to the specified address.
     ///
     /// # Parameters
@@ -154,7 +154,7 @@ impl Memory {
             Ok(())
         }
     }
-    
+
     /// Reads a 32-bit long word from the specified address.
     ///
     /// # Parameters
@@ -176,29 +176,29 @@ impl Memory {
         if addr & 1 != 0 {
             return Err(Exception::AddressError);
         }
-        
+
         match addr {
             // For ROM: check that addr+3 is within bounds, then combine 4 consecutive bytes.
             0x000000..=0x3FFFFF if (addr + 3) < self.rom.len() as u32 => {
                 let i = addr as usize;
-                Ok(((self.rom[i] as u32) << 24) | 
-                   ((self.rom[i+1] as u32) << 16) | 
-                   ((self.rom[i+2] as u32) << 8) | 
-                   (self.rom[i+3] as u32))
-            },
+                Ok(((self.rom[i] as u32) << 24)
+                    | ((self.rom[i + 1] as u32) << 16)
+                    | ((self.rom[i + 2] as u32) << 8)
+                    | (self.rom[i + 3] as u32))
+            }
             // For RAM: use masked address to access the 64KB RAM array and combine bytes.
             0xFF0000..=0xFFFFFF => {
                 let i = (addr & 0xFFFF) as usize;
-                Ok(((self.ram[i] as u32) << 24) | 
-                   ((self.ram[i+1] as u32) << 16) | 
-                   ((self.ram[i+2] as u32) << 8) | 
-                   (self.ram[i+3] as u32))
-            },
+                Ok(((self.ram[i] as u32) << 24)
+                    | ((self.ram[i + 1] as u32) << 16)
+                    | ((self.ram[i + 2] as u32) << 8)
+                    | (self.ram[i + 3] as u32))
+            }
             // All other addresses are invalid for a long word read.
             _ => Err(Exception::AddressError),
         }
     }
-    
+
     /// Writes a 32-bit long word to the specified address.
     ///
     /// # Parameters

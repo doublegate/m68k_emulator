@@ -9,13 +9,13 @@ pub struct Emulator {
 
 impl Emulator {
     pub fn new(rom_data: Vec<u8>) -> Emulator {
-		let memory = Memory::new(rom_data);
-		let mut cpu = CPU::new(memory);
-		cpu.pc = cpu.memory.read_long(4).unwrap_or(0); // Handle errors as needed
-		cpu.a[7] = cpu.memory.read_long(0).unwrap_or(0);
-		cpu.prefetch();
-		Emulator { cpu }
-	}
+        let memory = Memory::new(rom_data);
+        let mut cpu = CPU::new(memory);
+        cpu.pc = cpu.memory.read_long(4).unwrap_or(0); // Handle errors as needed
+        cpu.a[7] = cpu.memory.read_long(0).unwrap_or(0);
+        cpu.prefetch();
+        Emulator { cpu }
+    }
 
     pub fn step(&mut self) -> u32 {
         self.cpu.step()
