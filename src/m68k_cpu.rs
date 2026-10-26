@@ -1608,6 +1608,7 @@ impl CPU {
             Operation::Rts => {
                 self.pc = self.cpu_read_long(self.a[7]);
                 self.a[7] += 4;
+                self.prefetch();
                 cycles = 16;
             }
             Operation::Move => {
@@ -1837,24 +1838,31 @@ impl CPU {
                 let size = instr.size.unwrap();
                 let src = instr.src.unwrap();
                 let dst = instr.dst.unwrap();
-                let shift_count = self.get_operand_value(Size::Long, &src) % size.bits();
-                let dst_val = self.get_operand_value(size, &dst);
-                let mask = (1 << size.bits()) - 1;
-                let result =
-                    ((dst_val >> shift_count) | (dst_val << (size.bits() - shift_count))) & mask;
+                let raw_count = self.get_operand_value(Size::Long, &src) & 0x3F;
+                let shift_count = raw_count % size.bits();
+                let dst_val = self.get_operand_value(size, &dst) & size.mask();
+                let mask = size.mask();
+                let result = if shift_count == 0 {
+                    dst_val
+                } else {
+                    ((dst_val >> shift_count) | (dst_val << (size.bits() - shift_count))) & mask
+                };
                 self.set_operand_value(size, &dst, result);
                 let n = (result & (1 << (size.bits() - 1))) != 0;
                 let z = result == 0;
-                let c = if shift_count > 0 {
+                let c = if raw_count == 0 {
+                    false
+                } else if shift_count > 0 {
                     (dst_val >> (shift_count - 1)) & 1 != 0
                 } else {
-                    false
+                    (dst_val >> (size.bits() - 1)) & 1 != 0
                 };
-                self.set_flags(n, z, false, c, c);
+                let x = (self.sr & 0x10) != 0;
+                self.set_flags(n, z, false, c, x);
                 cycles = match size {
                     Size::Byte | Size::Word => 6,
                     Size::Long => 8,
-                } + 2 * shift_count;
+                } + 2 * raw_count;
             }
             Operation::Eori => {
                 let size = instr.size.unwrap();
@@ -2244,54 +2252,63 @@ impl CPU {
                 let size = instr.size.unwrap();
                 let src = instr.src.unwrap();
                 let dst = instr.dst.unwrap();
-                let shift_count = self.get_operand_value(Size::Long, &src) % size.bits();
-                let dst_val = self.get_operand_value(size, &dst);
-                let result = dst_val.rotate_left(shift_count);
+                let raw_count = self.get_operand_value(Size::Long, &src) & 0x3F;
+                let shift_count = raw_count % size.bits();
+                let dst_val = self.get_operand_value(size, &dst) & size.mask();
+                let mask = size.mask();
+                let result = if shift_count == 0 {
+                    dst_val
+                } else {
+                    ((dst_val << shift_count) | (dst_val >> (size.bits() - shift_count))) & mask
+                };
                 self.set_operand_value(size, &dst, result);
                 let n = (result & (1 << (size.bits() - 1))) != 0;
                 let z = result == 0;
-                let c = if shift_count > 0 {
+                let c = if raw_count == 0 {
+                    false
+                } else if shift_count > 0 {
                     (dst_val & (1 << (size.bits() - shift_count))) != 0
                 } else {
-                    false
+                    (dst_val & 1) != 0
                 };
-                self.set_flags(n, z, false, c, c);
+                let x = (self.sr & 0x10) != 0;
+                self.set_flags(n, z, false, c, x);
                 cycles = match size {
                     Size::Byte | Size::Word => 6,
                     Size::Long => 8,
-                } + 2 * shift_count;
+                } + 2 * raw_count;
             }
             Operation::Roxl => {
                 let size = instr.size.unwrap();
                 let src = instr.src.unwrap();
                 let dst = instr.dst.unwrap();
-                let shift_count = self.get_operand_value(Size::Long, &src) % (size.bits() + 1);
-                let dst_val = self.get_operand_value(size, &dst);
-                let x = (self.sr & 0x1) != 0;
+                let raw_count = self.get_operand_value(Size::Long, &src) & 0x3F;
+                let width = size.bits() + 1;
+                let shift_count = raw_count % width;
+                let dst_val = self.get_operand_value(size, &dst) & size.mask();
+                let x = (self.sr & 0x10) != 0;
                 let shift = size.bits();
-                let full_val = if x { dst_val | (1 << shift) } else { dst_val };
-                let result = if shift_count == 0 {
-                    dst_val
+                let full_val = (dst_val as u64) | (if x { 1u64 << shift } else { 0 });
+                let rotated = if shift_count == 0 {
+                    full_val
                 } else {
-                    full_val.rotate_left(shift_count) & size.mask()
+                    ((full_val << shift_count) | (full_val >> (width - shift_count)))
+                        & ((1u64 << width) - 1)
                 };
+                let result = (rotated as u32) & size.mask();
                 self.set_operand_value(size, &dst, result);
                 let n = (result & (1 << (shift - 1))) != 0;
                 let z = result == 0;
-                let c = if shift_count > 0 {
-                    (full_val & (1 << (shift + 1 - shift_count))) != 0
-                } else {
-                    false
-                };
+                let c = (rotated & (1u64 << shift)) != 0;
                 self.set_flags(n, z, false, c, c);
-                self.sr = (self.sr & 0xFFFE) | (if c { 1 } else { 0 });
                 cycles = match size {
                     Size::Byte | Size::Word => 6,
                     Size::Long => 8,
-                } + 2 * shift_count;
+                } + 2 * raw_count;
             }
             Operation::Jsr => {
                 let src = instr.src.unwrap();
+                let return_pc = self.pc.wrapping_sub(4);
                 let addr = match src {
                     Operand::Indirect(reg) => self.a[reg as usize],
                     Operand::Displacement(reg, disp) => {
@@ -2310,10 +2327,10 @@ impl CPU {
                     Operand::AbsoluteShort(addr) => addr as i16 as i32 as u32,
                     Operand::AbsoluteLong(addr) => addr,
                     Operand::PCDisplacement(disp) => {
-                        self.pc.wrapping_add(disp as i32 as u32).wrapping_sub(2)
+                        self.pc.wrapping_sub(6).wrapping_add(disp as i32 as u32)
                     }
                     Operand::PCIndexed(disp, idx_reg, idx_size) => {
-                        let base = self.pc.wrapping_sub(2);
+                        let base = self.pc.wrapping_sub(6);
                         let index = match idx_size {
                             Size::Word => (self.d[idx_reg as usize] as i16) as i32,
                             Size::Long => self.d[idx_reg as usize] as i32,
@@ -2324,9 +2341,10 @@ impl CPU {
                     }
                     _ => panic!("Unsupported addressing mode for JSR: {:?}", src),
                 };
-                self.a[7] -= 4;
-                self.cpu_write_long(self.a[7], self.pc);
+                self.a[7] = self.a[7].wrapping_sub(4);
+                self.cpu_write_long(self.a[7], return_pc);
                 self.pc = addr;
+                self.prefetch();
                 cycles = match src {
                     Operand::Displacement(_, _) => 18,
                     Operand::AbsoluteShort(_) => 18,
@@ -2549,30 +2567,29 @@ impl CPU {
                 let size = instr.size.unwrap();
                 let src = instr.src.unwrap();
                 let dst = instr.dst.unwrap();
-                let shift_count = self.get_operand_value(Size::Long, &src) % (size.bits() + 1);
-                let dst_val = self.get_operand_value(size, &dst);
-                let x = (self.sr & 0x1) != 0;
+                let raw_count = self.get_operand_value(Size::Long, &src) & 0x3F;
+                let width = size.bits() + 1;
+                let shift_count = raw_count % width;
+                let dst_val = self.get_operand_value(size, &dst) & size.mask();
+                let x = (self.sr & 0x10) != 0;
                 let shift = size.bits();
-                let full_val = if x { dst_val | (1 << shift) } else { dst_val };
-                let result = if shift_count == 0 {
-                    dst_val
+                let full_val = (dst_val as u64) | (if x { 1u64 << shift } else { 0 });
+                let rotated = if shift_count == 0 {
+                    full_val
                 } else {
-                    full_val.rotate_right(shift_count) & size.mask()
+                    ((full_val >> shift_count) | (full_val << (width - shift_count)))
+                        & ((1u64 << width) - 1)
                 };
+                let result = (rotated as u32) & size.mask();
                 self.set_operand_value(size, &dst, result);
                 let n = (result & (1 << (shift - 1))) != 0;
                 let z = result == 0;
-                let c = if shift_count > 0 {
-                    (full_val & (1 << (shift_count - 1))) != 0
-                } else {
-                    false
-                };
+                let c = (rotated & (1u64 << shift)) != 0;
                 self.set_flags(n, z, false, c, c);
-                self.sr = (self.sr & 0xFFFE) | (if c { 1 } else { 0 });
                 cycles = match size {
                     Size::Byte | Size::Word => 6,
                     Size::Long => 8,
-                } + 2 * shift_count;
+                } + 2 * raw_count;
             }
             Operation::Bhi => {
                 let target = self.get_operand_value(Size::Long, &instr.src.unwrap());
@@ -2781,48 +2798,111 @@ impl CPU {
                 let size = instr.size.unwrap();
                 let src = instr.src.unwrap();
                 let dst = instr.dst.unwrap();
-                let reglist = if let Operand::Immediate(mask) = src {
-                    mask as u16
-                } else {
-                    self.get_operand_value(Size::Long, &dst) as u16
-                };
-                let mut addr = match dst {
-                    Operand::Indirect(reg) => self.a[reg as usize],
-                    Operand::Displacement(reg, disp) => {
-                        self.a[reg as usize].wrapping_add(disp as u32)
-                    }
-                    _ => match src {
-                        Operand::Indirect(reg) => self.a[reg as usize],
-                        Operand::Displacement(reg, disp) => {
-                            self.a[reg as usize].wrapping_add(disp as u32)
+                let step_bytes = if size == Size::Word { 2u32 } else { 4u32 };
+                if let Operand::Immediate(mask) = src {
+                    let reglist = mask as u16;
+                    let regs = reglist.count_ones();
+                    match dst {
+                        Operand::PreDec(reg) => {
+                            let mut addr = self.a[reg as usize];
+                            for i in 0..16 {
+                                if (reglist & (1 << i)) != 0 {
+                                    let reg_idx = 15 - i;
+                                    let value = if reg_idx < 8 {
+                                        self.d[reg_idx]
+                                    } else {
+                                        self.a[reg_idx - 8]
+                                    };
+                                    addr = addr.wrapping_sub(step_bytes);
+                                    if size == Size::Word {
+                                        self.cpu_write_word(addr, value as u16);
+                                    } else {
+                                        self.cpu_write_long(addr, value);
+                                    }
+                                }
+                            }
+                            self.a[reg as usize] = addr;
                         }
-                        _ => panic!("Unsupported MOVEM addressing mode"),
-                    },
-                };
-                let regs = reglist.count_ones();
-                if let Operand::Immediate(_) = src {
-                    for i in 0..16 {
-                        if (reglist & (1 << i)) != 0 {
-                            let value = if i < 8 { self.d[i] } else { self.a[i - 8] };
-                            if size == Size::Word {
-                                self.cpu_write_word(addr, value as u16);
-                                addr += 2;
-                            } else {
-                                self.cpu_write_long(addr, value);
-                                addr += 4;
+                        _ => {
+                            let mut addr = match dst {
+                                Operand::Indirect(reg) => self.a[reg as usize],
+                                Operand::Displacement(reg, disp) => {
+                                    self.a[reg as usize].wrapping_add(disp as i32 as u32)
+                                }
+                                Operand::Indexed(reg, disp, idx_reg, idx_size) => {
+                                    let base = self.a[reg as usize];
+                                    let index = match idx_size {
+                                        Size::Word => (self.d[idx_reg as usize] as i16) as i32,
+                                        Size::Long => self.d[idx_reg as usize] as i32,
+                                        _ => unreachable!(),
+                                    };
+                                    base.wrapping_add(disp as i32 as u32)
+                                        .wrapping_add(index as u32)
+                                }
+                                Operand::AbsoluteShort(addr) => addr as i16 as i32 as u32,
+                                Operand::AbsoluteLong(addr) => addr,
+                                _ => panic!("Unsupported MOVEM destination mode: {:?}", dst),
+                            };
+                            for i in 0..16 {
+                                if (reglist & (1 << i)) != 0 {
+                                    let value = if i < 8 { self.d[i] } else { self.a[i - 8] };
+                                    if size == Size::Word {
+                                        self.cpu_write_word(addr, value as u16);
+                                    } else {
+                                        self.cpu_write_long(addr, value);
+                                    }
+                                    addr = addr.wrapping_add(step_bytes);
+                                }
                             }
                         }
                     }
-                } else {
+                    cycles = 8
+                        + self.ea_cycles(&dst, size)
+                        + (if size == Size::Word { 4 } else { 8 } * regs);
+                } else if let Operand::Immediate(mask) = dst {
+                    let reglist = mask as u16;
+                    let regs = reglist.count_ones();
+                    let mut addr = match src {
+                        Operand::Indirect(reg) | Operand::PostInc(reg) => self.a[reg as usize],
+                        Operand::Displacement(reg, disp) => {
+                            self.a[reg as usize].wrapping_add(disp as i32 as u32)
+                        }
+                        Operand::Indexed(reg, disp, idx_reg, idx_size) => {
+                            let base = self.a[reg as usize];
+                            let index = match idx_size {
+                                Size::Word => (self.d[idx_reg as usize] as i16) as i32,
+                                Size::Long => self.d[idx_reg as usize] as i32,
+                                _ => unreachable!(),
+                            };
+                            base.wrapping_add(disp as i32 as u32)
+                                .wrapping_add(index as u32)
+                        }
+                        Operand::AbsoluteShort(addr) => addr as i16 as i32 as u32,
+                        Operand::AbsoluteLong(addr) => addr,
+                        Operand::PCDisplacement(disp) => {
+                            self.pc.wrapping_sub(6).wrapping_add(disp as i32 as u32)
+                        }
+                        Operand::PCIndexed(disp, idx_reg, idx_size) => {
+                            let base = self.pc.wrapping_sub(6);
+                            let index = match idx_size {
+                                Size::Word => (self.d[idx_reg as usize] as i16) as i32,
+                                Size::Long => self.d[idx_reg as usize] as i32,
+                                _ => unreachable!(),
+                            };
+                            base.wrapping_add(disp as i32 as u32)
+                                .wrapping_add(index as u32)
+                        }
+                        _ => panic!("Unsupported MOVEM source mode: {:?}", src),
+                    };
                     for i in 0..16 {
                         if (reglist & (1 << i)) != 0 {
                             let value = if size == Size::Word {
-                                let val = self.cpu_read_word(addr) as u32;
-                                addr += 2;
+                                let val = self.cpu_read_word(addr) as i16 as i32 as u32;
+                                addr = addr.wrapping_add(2);
                                 val
                             } else {
                                 let val = self.cpu_read_long(addr);
-                                addr += 4;
+                                addr = addr.wrapping_add(4);
                                 val
                             };
                             if i < 8 {
@@ -2832,10 +2912,15 @@ impl CPU {
                             }
                         }
                     }
+                    if let Operand::PostInc(reg) = src {
+                        self.a[reg as usize] = addr;
+                    }
+                    cycles = 12
+                        + self.ea_cycles(&src, size)
+                        + (if size == Size::Word { 4 } else { 8 } * regs);
+                } else {
+                    panic!("MOVEM missing immediate register list mask");
                 }
-                cycles = 12
-                    + self.ea_cycles(&src, size)
-                    + (if size == Size::Word { 4 } else { 8 } * regs);
             }
             Operation::AslMem => {
                 let size = instr.size.unwrap();
